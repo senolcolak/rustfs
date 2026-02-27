@@ -33,6 +33,7 @@ use rustfs_credentials::Credentials;
 /// - Account format is invalid
 /// - Credentials don't contain project_id
 /// - Account project_id doesn't match credentials project_id
+#[allow(dead_code)] // Phase 1: Will be used in Phase 2-3
 pub fn validate_account_access(account: &str, credentials: &Credentials) -> SwiftResult<String> {
     // Extract project_id from account (strip "AUTH_" prefix)
     let account_project_id = account
@@ -64,6 +65,7 @@ pub fn validate_account_access(account: &str, credentials: &Credentials) -> Swif
 ///
 /// Admin users (with "admin" or "reseller_admin" roles) can perform
 /// cross-tenant operations and administrative tasks.
+#[allow(dead_code)] // Phase 1: Will be used in Phase 2-3
 pub fn is_admin_user(credentials: &Credentials) -> bool {
     credentials
         .claims
@@ -85,15 +87,15 @@ mod tests {
     use std::collections::HashMap;
 
     fn create_test_credentials(project_id: &str, roles: Vec<&str>) -> Credentials {
-        let mut credentials = Credentials::default();
-        credentials.access_key = format!("keystone:user123");
-
         let mut claims = HashMap::new();
         claims.insert("keystone_project_id".to_string(), json!(project_id));
         claims.insert("keystone_roles".to_string(), json!(roles));
-        credentials.claims = Some(claims);
 
-        credentials
+        Credentials {
+            access_key: "keystone:user123".to_string(),
+            claims: Some(claims),
+            ..Default::default()
+        }
     }
 
     #[test]

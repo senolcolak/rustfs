@@ -19,6 +19,7 @@
 use crate::swift::SwiftResult;
 
 // Placeholder - will be implemented in Phase 3
+#[allow(dead_code)]
 pub async fn get_object() -> SwiftResult<Vec<u8>> {
     // TODO: Implement in Phase 3
     Ok(vec![])

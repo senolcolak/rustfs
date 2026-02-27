@@ -18,7 +18,7 @@
 //! requests and delegates to appropriate Swift handlers or falls through
 //! to S3 service for non-Swift requests.
 
-use crate::swift::{SwiftError, SwiftRoute, SwiftRouter};
+use crate::swift::{SwiftRoute, SwiftRouter};
 use axum::http::{Request, Response, StatusCode};
 use futures::Future;
 use s3s::Body;

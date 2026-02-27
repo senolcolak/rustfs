@@ -19,6 +19,7 @@
 use crate::swift::SwiftResult;
 
 // Placeholder - will be implemented in Phase 2
+#[allow(dead_code)]
 pub async fn list_containers() -> SwiftResult<Vec<crate::swift::types::Container>> {
     // TODO: Implement in Phase 2
     Ok(vec![])
