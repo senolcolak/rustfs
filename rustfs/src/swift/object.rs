@@ -16,6 +16,27 @@
 //!
 //! This module implements Swift object CRUD operations including upload, download,
 //! metadata management, and server-side copy.
+//!
+//! ## Server-Side Copy
+//!
+//! Swift supports two methods for server-side object copying:
+//!
+//! 1. **COPY method with Destination header**:
+//!    ```text
+//!    COPY /v1/AUTH_account/container/source_object
+//!    Destination: /container/dest_object
+//!    X-Auth-Token: token
+//!    ```
+//!
+//! 2. **PUT method with X-Copy-From header**:
+//!    ```text
+//!    PUT /v1/AUTH_account/container/dest_object
+//!    X-Copy-From: /container/source_object
+//!    X-Auth-Token: token
+//!    ```
+//!
+//! The `copy_object` function implements the core copy logic. Handler integration
+//! requires passing request headers to identify copy operations.
 
 use crate::swift::{SwiftError, SwiftResult};
 use crate::swift::account::validate_account_access;
@@ -601,6 +622,212 @@ pub async fn update_object_metadata(
     Ok(())
 }
 
+/// Server-side copy object (COPY)
+///
+/// Copies an object from source container/object to destination container/object
+/// without transferring data through the client. This is a Swift-specific operation
+/// that uses the underlying storage layer's copy capabilities.
+///
+/// # Arguments
+/// * `src_account` - Source Swift account name (AUTH_{project_id})
+/// * `src_container` - Source container name
+/// * `src_object` - Source object name
+/// * `dst_account` - Destination Swift account name (AUTH_{project_id})
+/// * `dst_container` - Destination container name
+/// * `dst_object` - Destination object name
+/// * `credentials` - User credentials with project_id
+/// * `headers` - HTTP headers (may contain metadata to set on destination)
+///
+/// # Returns
+/// * `Ok(String)` - ETag of the copied object
+/// * `Err(SwiftError)` - Error if validation fails, source not found, or copy fails
+///
+/// # Swift COPY Behavior
+/// - Copies object data and system metadata (content-type, etag, etc.)
+/// - Can optionally set new custom metadata via X-Object-Meta-* headers
+/// - If no custom metadata provided, copies source custom metadata
+/// - Destination container must exist before copy
+/// - Atomic operation (either succeeds completely or fails)
+///
+/// # Handler Integration Note
+/// The current handler architecture needs to be updated to pass headers through
+/// to support COPY method and X-Copy-From header detection. See handler.rs for details.
+#[allow(dead_code)] // Phase 3: Will be used in handler for COPY object operation
+pub async fn copy_object(
+    src_account: &str,
+    src_container: &str,
+    src_object: &str,
+    dst_account: &str,
+    dst_container: &str,
+    dst_object: &str,
+    credentials: &Credentials,
+    headers: &HeaderMap,
+) -> SwiftResult<String> {
+    // 1. Validate source account access and get project_id
+    let src_project_id = validate_account_access(src_account, credentials)?;
+
+    // 2. Validate destination account access (may be different account)
+    let dst_project_id = validate_account_access(dst_account, credentials)?;
+
+    // 3. Validate object names
+    ObjectKeyMapper::validate_object_name(src_object)?;
+    ObjectKeyMapper::validate_object_name(dst_object)?;
+
+    // 4. Get S3 keys from object names
+    let src_s3_key = ObjectKeyMapper::swift_to_s3_key(src_object)?;
+    let dst_s3_key = ObjectKeyMapper::swift_to_s3_key(dst_object)?;
+
+    // 5. Map containers to buckets using tenant prefixing
+    let mapper = ContainerMapper::default();
+    let src_bucket = mapper.swift_to_s3_bucket(src_container, &src_project_id);
+    let dst_bucket = mapper.swift_to_s3_bucket(dst_container, &dst_project_id);
+
+    // 6. Get storage layer
+    let Some(store) = new_object_layer_fn() else {
+        return Err(SwiftError::InternalServerError(
+            "Storage layer not initialized".to_string()
+        ));
+    };
+
+    // 7. First, verify source object exists and get its info
+    let src_opts = ObjectOptions::default();
+    let mut src_info = store
+        .get_object_info(&src_bucket, &src_s3_key, &src_opts)
+        .await
+        .map_err(|e| {
+            let err_str = e.to_string();
+            if err_str.contains("does not exist") || err_str.contains("not found") {
+                SwiftError::NotFound(format!("Source object '{}' not found in container '{}'", src_object, src_container))
+            } else {
+                SwiftError::InternalServerError(format!("Failed to get source object info: {}", e))
+            }
+        })?;
+
+    // 8. Check if source is a delete marker
+    if src_info.delete_marker {
+        return Err(SwiftError::NotFound(format!("Source object '{}' not found in container '{}'", src_object, src_container)));
+    }
+
+    // 9. Verify destination container exists by trying to get its info
+    let bucket_opts = BucketOptions::default();
+    let _dst_bucket_info = store
+        .get_bucket_info(&dst_bucket, &bucket_opts)
+        .await
+        .map_err(|e| {
+            let err_str = e.to_string();
+            if err_str.contains("does not exist") || err_str.contains("not found") {
+                SwiftError::NotFound(format!("Destination container '{}' not found", dst_container))
+            } else {
+                SwiftError::InternalServerError(format!("Failed to check destination container: {}", e))
+            }
+        })?;
+
+    // 10. Prepare metadata for destination object
+    // Start with source metadata
+    let mut new_metadata = src_info.user_defined.clone();
+
+    // 11. If custom metadata headers provided, use those instead (Swift behavior)
+    let mut has_custom_meta = false;
+    for (header_name, header_value) in headers.iter() {
+        let header_str = header_name.as_str().to_lowercase();
+        if header_str.starts_with("x-object-meta-") {
+            if !has_custom_meta {
+                // First custom meta header - clear source metadata
+                new_metadata.clear();
+                has_custom_meta = true;
+            }
+            let meta_key = &header_str[14..]; // Remove "x-object-meta-" prefix
+            if let Ok(value_str) = header_value.to_str() {
+                new_metadata.insert(meta_key.to_string(), value_str.to_string());
+            }
+        }
+    }
+
+    // 12. Also check for Content-Type override
+    let content_type = if let Some(ct) = headers.get("content-type") {
+        ct.to_str().ok().map(|s| s.to_string())
+    } else {
+        src_info.content_type.clone()
+    };
+
+    if let Some(ct) = content_type {
+        new_metadata.insert("content-type".to_string(), ct);
+    }
+
+    // 13. Prepare destination options
+    let mut dst_opts = ObjectOptions::default();
+    dst_opts.user_defined = new_metadata;
+
+    // 14. Perform server-side copy
+    let dst_info = store
+        .copy_object(&src_bucket, &src_s3_key, &dst_bucket, &dst_s3_key, &mut src_info, &src_opts, &dst_opts)
+        .await
+        .map_err(|e| {
+            SwiftError::InternalServerError(format!("Failed to copy object: {}", e))
+        })?;
+
+    // 15. Return the ETag of the destination object
+    Ok(dst_info.etag.unwrap_or_default())
+}
+
+/// Parse Swift Destination header
+///
+/// The Destination header format is: `/container/object` or `/account/container/object`
+/// This function parses it into container and object components.
+///
+/// # Arguments
+/// * `destination` - The Destination header value
+///
+/// # Returns
+/// * `Ok((container, object))` - Parsed container and object names
+/// * `Err(SwiftError)` - Error if format is invalid
+///
+/// # Examples
+/// ```ignore
+/// let (container, object) = parse_destination_header("/my-container/my-object.txt")?;
+/// assert_eq!(container, "my-container");
+/// assert_eq!(object, "my-object.txt");
+/// ```
+#[allow(dead_code)] // Phase 3: Will be used when handler supports COPY method
+pub fn parse_destination_header(destination: &str) -> SwiftResult<(String, String)> {
+    let destination = destination.trim_start_matches('/');
+    let parts: Vec<&str> = destination.splitn(2, '/').collect();
+
+    if parts.len() < 2 {
+        return Err(SwiftError::BadRequest(
+            "Invalid Destination header format. Expected: /container/object".to_string()
+        ));
+    }
+
+    let container = parts[0].to_string();
+    let object = parts[1].to_string();
+
+    if container.is_empty() || object.is_empty() {
+        return Err(SwiftError::BadRequest(
+            "Destination container and object names cannot be empty".to_string()
+        ));
+    }
+
+    Ok((container, object))
+}
+
+/// Parse Swift X-Copy-From header
+///
+/// The X-Copy-From header format is: `/container/object`
+/// This function parses it into container and object components.
+///
+/// # Arguments
+/// * `copy_from` - The X-Copy-From header value
+///
+/// # Returns
+/// * `Ok((container, object))` - Parsed container and object names
+/// * `Err(SwiftError)` - Error if format is invalid
+#[allow(dead_code)] // Phase 3: Will be used when handler supports X-Copy-From
+pub fn parse_copy_from_header(copy_from: &str) -> SwiftResult<(String, String)> {
+    // Same parsing logic as Destination header
+    parse_destination_header(copy_from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -766,9 +993,48 @@ mod tests {
 
         // Empty segments
         assert_eq!(
-            ObjectKeyMapper::normalize_path("path/./to/file.txt"),
-            "path/./to/file.txt"  // We keep "." as it might be intentional
+            ObjectKeyMapper::normalize_path("path///to/file.txt"),
+            "path/to/file.txt"
         );
+    }
+
+    #[test]
+    fn test_parse_destination_header() {
+        // Valid destination headers
+        let (container, object) = parse_destination_header("/my-container/my-object.txt").unwrap();
+        assert_eq!(container, "my-container");
+        assert_eq!(object, "my-object.txt");
+
+        let (container, object) = parse_destination_header("/container/path/to/object.txt").unwrap();
+        assert_eq!(container, "container");
+        assert_eq!(object, "path/to/object.txt");
+
+        // Without leading slash
+        let (container, object) = parse_destination_header("container/object.txt").unwrap();
+        assert_eq!(container, "container");
+        assert_eq!(object, "object.txt");
+
+        // Invalid formats
+        assert!(parse_destination_header("/container-only").is_err());
+        assert!(parse_destination_header("/").is_err());
+        assert!(parse_destination_header("").is_err());
+        assert!(parse_destination_header("/container/").is_err());
+    }
+
+    #[test]
+    fn test_parse_copy_from_header() {
+        // Valid X-Copy-From headers
+        let (container, object) = parse_copy_from_header("/source-container/source.txt").unwrap();
+        assert_eq!(container, "source-container");
+        assert_eq!(object, "source.txt");
+
+        let (container, object) = parse_copy_from_header("/my-container/photos/vacation.jpg").unwrap();
+        assert_eq!(container, "my-container");
+        assert_eq!(object, "photos/vacation.jpg");
+
+        // Invalid formats (same as destination header)
+        assert!(parse_copy_from_header("/container-only").is_err());
+        assert!(parse_copy_from_header("").is_err());
     }
 
     #[test]
