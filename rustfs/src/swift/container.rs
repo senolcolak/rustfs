@@ -486,6 +486,120 @@ pub async fn delete_container(
     Ok(())
 }
 
+/// List objects in a container (GET /v1/{account}/{container})
+///
+/// Returns a list of objects within the specified container.
+/// Supports pagination, prefix filtering, and delimiter-based hierarchical listing.
+///
+/// # Arguments
+///
+/// * `account` - Swift account identifier (AUTH_{project_id})
+/// * `container` - Container name
+/// * `credentials` - Keystone credentials from middleware
+/// * `limit` - Maximum number of objects to return (default 10000)
+/// * `marker` - Pagination marker (start after this object name)
+/// * `prefix` - Filter objects by prefix
+/// * `delimiter` - Delimiter for hierarchical listings (usually "/")
+///
+/// # Returns
+///
+/// A vector of Object structs containing object metadata
+///
+/// # Errors
+///
+/// Returns SwiftError if:
+/// - Account validation fails
+/// - Container doesn't exist
+/// - Storage layer errors occur
+#[allow(dead_code)] // Phase 3: Will be used in handler for GET container operation
+pub async fn list_objects(
+    account: &str,
+    container: &str,
+    credentials: &Credentials,
+    limit: Option<i32>,
+    marker: Option<String>,
+    prefix: Option<String>,
+    delimiter: Option<String>,
+) -> SwiftResult<Vec<crate::swift::types::Object>> {
+    use crate::swift::types::Object;
+
+    // Validate account access and extract project_id
+    let project_id = validate_account_access(account, credentials)?;
+
+    // Map container to bucket
+    let mapper = ContainerMapper::default();
+    let bucket = mapper.swift_to_s3_bucket(container, &project_id);
+
+    // Get storage layer
+    let Some(store) = new_object_layer_fn() else {
+        return Err(SwiftError::InternalServerError(
+            "Storage layer not initialized".to_string()
+        ));
+    };
+
+    // Verify bucket exists
+    store
+        .get_bucket_info(&bucket, &BucketOptions::default())
+        .await
+        .map_err(|e| {
+            if e.to_string().contains("does not exist") {
+                SwiftError::NotFound(format!("Container '{}' not found", container))
+            } else {
+                SwiftError::InternalServerError(format!("Failed to access container: {}", e))
+            }
+        })?;
+
+    // Prepare list parameters
+    let max_keys = limit.unwrap_or(10000).max(0) as i32;
+    let prefix_str = prefix.unwrap_or_default();
+    let delimiter_opt = delimiter.filter(|d| !d.is_empty());
+
+    // List objects from storage
+    let object_infos = store
+        .list_objects_v2(
+            &bucket,
+            &prefix_str,
+            marker,
+            delimiter_opt,
+            max_keys,
+            false, // fetch_owner
+            None,  // start_after
+            false, // include_deleted
+        )
+        .await
+        .map_err(|e| {
+            SwiftError::InternalServerError(format!("Failed to list objects: {}", e))
+        })?;
+
+    // Convert ObjectInfo to Swift Object format
+    let mut swift_objects = Vec::new();
+    for obj_info in object_infos.objects {
+        // Skip empty names
+        if obj_info.name.is_empty() {
+            continue;
+        }
+
+        // Format last_modified as ISO 8601
+        let last_modified = if let Some(mod_time) = obj_info.mod_time {
+            mod_time
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        swift_objects.push(Object {
+            name: obj_info.name,
+            hash: obj_info.etag.unwrap_or_default(),
+            bytes: obj_info.size as u64,
+            content_type: obj_info.content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
+            last_modified,
+        });
+    }
+
+    Ok(swift_objects)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
