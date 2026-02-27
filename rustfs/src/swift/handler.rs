@@ -18,9 +18,11 @@
 //! requests and delegates to appropriate Swift handlers or falls through
 //! to S3 service for non-Swift requests.
 
-use crate::swift::{SwiftRoute, SwiftRouter};
-use axum::http::{Request, Response, StatusCode};
+use crate::swift::{SwiftRoute, SwiftRouter, SwiftError};
+use crate::swift::container;
+use axum::http::{Method, Request, Response, StatusCode};
 use futures::Future;
+use rustfs_credentials::Credentials;
 use s3s::Body;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -69,10 +71,20 @@ where
         if let Some(route) = router.route(&uri, method.clone()) {
             debug!("Swift route matched: {:?}", route);
 
-            // For Phase 1, return "Not Implemented" for all Swift operations
-            // This will be replaced with actual handlers in Phase 2-3
-            let response = handle_swift_request_phase1(route);
-            return Box::pin(async move { Ok(response) });
+            // Extract credentials from request if available
+            let credentials = req.extensions().get::<Credentials>().cloned();
+
+            // Handle Swift operations based on route and method
+            let response_future = handle_swift_request(route, credentials);
+            return Box::pin(async move {
+                match response_future.await {
+                    Ok(response) => Ok(response),
+                    Err(swift_error) => {
+                        // Convert SwiftError to Response
+                        Ok(swift_error_to_response(swift_error))
+                    }
+                }
+            });
         }
 
         // Not a Swift request, delegate to S3 service
@@ -82,19 +94,149 @@ where
     }
 }
 
-/// Phase 1 handler - returns 501 Not Implemented for all Swift operations
-/// This will be replaced with actual implementations in Phase 2-3
-fn handle_swift_request_phase1(route: SwiftRoute) -> Response<Body> {
-    let message = match route {
+/// Handle Swift API requests
+async fn handle_swift_request(
+    route: SwiftRoute,
+    credentials: Option<Credentials>,
+) -> Result<Response<Body>, SwiftError> {
+
+    // Credentials are required for all Swift operations
+    let credentials = credentials.ok_or_else(|| {
+        SwiftError::Unauthorized("Authentication required".to_string())
+    })?;
+
+    match route {
         SwiftRoute::Account { account, method } => {
-            format!("Swift Account operation not yet implemented: {} {}", method, account)
+            match method {
+                Method::GET => {
+                    // List containers
+                    let containers = container::list_containers(&account, &credentials).await?;
+
+                    // Generate JSON response
+                    let json = serde_json::to_string(&containers)
+                        .map_err(|e| SwiftError::InternalServerError(format!("JSON serialization failed: {}", e)))?;
+
+                    let trans_id = generate_trans_id();
+                    Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "application/json; charset=utf-8")
+                        .header("x-trans-id", trans_id.clone())
+                        .header("x-openstack-request-id", trans_id)
+                        .body(Body::from(json))
+                        .unwrap())
+                }
+                Method::HEAD => {
+                    // Account metadata - Phase 2
+                    Err(SwiftError::InternalServerError(
+                        format!("Swift Account HEAD operation not yet implemented: HEAD {}", account)
+                    ))
+                }
+                Method::POST => {
+                    // Update account metadata - Phase 2
+                    Err(SwiftError::InternalServerError(
+                        format!("Swift Account POST operation not yet implemented: POST {}", account)
+                    ))
+                }
+                _ => {
+                    Err(SwiftError::BadRequest(format!("Unsupported method for account: {}", method)))
+                }
+            }
         }
         SwiftRoute::Container {
             account,
             container,
             method,
         } => {
-            format!("Swift Container operation not yet implemented: {} {}/{}", method, account, container)
+            match method {
+                Method::PUT => {
+                    // Create container
+                    let is_new = container::create_container(&account, &container, &credentials).await?;
+
+                    let trans_id = generate_trans_id();
+                    let status = if is_new {
+                        StatusCode::CREATED // 201 - Container created
+                    } else {
+                        StatusCode::ACCEPTED // 202 - Container already exists
+                    };
+
+                    Ok(Response::builder()
+                        .status(status)
+                        .header("content-type", "text/html; charset=utf-8")
+                        .header("content-length", "0")
+                        .header("x-trans-id", trans_id.clone())
+                        .header("x-openstack-request-id", trans_id)
+                        .body(Body::empty())
+                        .unwrap())
+                }
+                Method::GET => {
+                    // List objects in container - Phase 3
+                    Err(SwiftError::InternalServerError(
+                        format!("Swift Container GET operation not yet implemented: GET {}/{}", account, container)
+                    ))
+                }
+                Method::HEAD => {
+                    // Container metadata
+                    let metadata = container::get_container_metadata(&account, &container, &credentials).await?;
+
+                    let trans_id = generate_trans_id();
+                    let mut response = Response::builder()
+                        .status(StatusCode::NO_CONTENT)
+                        .header("content-type", "text/html; charset=utf-8")
+                        .header("content-length", "0")
+                        .header("x-container-object-count", metadata.object_count.to_string())
+                        .header("x-container-bytes-used", metadata.bytes_used.to_string())
+                        .header("x-trans-id", trans_id.clone())
+                        .header("x-openstack-request-id", trans_id.clone());
+
+                    // Add creation timestamp if available
+                    if let Some(created) = metadata.created
+                        && let Ok(timestamp_str) = created.format(&time::format_description::well_known::Rfc3339) {
+                        response = response.header("x-timestamp", timestamp_str);
+                    }
+
+                    // Add custom metadata headers (X-Container-Meta-*)
+                    for (key, value) in metadata.custom_metadata {
+                        let header_name = format!("x-container-meta-{}", key.to_lowercase());
+                        response = response.header(header_name, value);
+                    }
+
+                    Ok(response.body(Body::empty()).unwrap())
+                }
+                Method::POST => {
+                    // Update container metadata
+                    // TODO: Extract metadata from request headers
+                    let metadata = std::collections::HashMap::new();
+
+                    container::update_container_metadata(&account, &container, &credentials, metadata).await?;
+
+                    let trans_id = generate_trans_id();
+                    Ok(Response::builder()
+                        .status(StatusCode::NO_CONTENT)
+                        .header("content-type", "text/html; charset=utf-8")
+                        .header("content-length", "0")
+                        .header("x-trans-id", trans_id.clone())
+                        .header("x-openstack-request-id", trans_id)
+                        .body(Body::empty())
+                        .unwrap())
+                }
+                Method::DELETE => {
+                    // Delete container
+                    container::delete_container(&account, &container, &credentials).await?;
+
+                    let trans_id = generate_trans_id();
+                    Ok(Response::builder()
+                        .status(StatusCode::NO_CONTENT)
+                        .header("content-type", "text/html; charset=utf-8")
+                        .header("content-length", "0")
+                        .header("x-trans-id", trans_id.clone())
+                        .header("x-openstack-request-id", trans_id)
+                        .body(Body::empty())
+                        .unwrap())
+                }
+                _ => {
+                    Err(SwiftError::BadRequest(format!("Unsupported method for container: {}", method)))
+                }
+            }
         }
         SwiftRoute::Object {
             account,
@@ -102,24 +244,44 @@ fn handle_swift_request_phase1(route: SwiftRoute) -> Response<Body> {
             object,
             method,
         } => {
-            format!(
-                "Swift Object operation not yet implemented: {} {}/{}/{}",
-                method, account, container, object
-            )
+            // Phase 3: Object operations
+            Err(SwiftError::InternalServerError(
+                format!(
+                    "Swift Object operation not yet implemented: {} {}/{}/{}",
+                    method, account, container, object
+                )
+            ))
         }
-    };
+    }
+}
 
-    // Generate transaction ID
+/// Generate a transaction ID for Swift responses
+fn generate_trans_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros();
-    let trans_id = format!("tx{:x}", timestamp);
+    format!("tx{:x}", timestamp)
+}
+
+/// Convert SwiftError to HTTP Response
+fn swift_error_to_response(error: SwiftError) -> Response<Body> {
+    let trans_id = generate_trans_id();
+    let (status, message) = match &error {
+        SwiftError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.as_str()),
+        SwiftError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg.as_str()),
+        SwiftError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg.as_str()),
+        SwiftError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.as_str()),
+        SwiftError::Conflict(msg) => (StatusCode::CONFLICT, msg.as_str()),
+        SwiftError::UnprocessableEntity(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg.as_str()),
+        SwiftError::InternalServerError(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.as_str()),
+        SwiftError::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg.as_str()),
+    };
 
     Response::builder()
-        .status(StatusCode::NOT_IMPLEMENTED)
+        .status(status)
         .header("content-type", "text/plain; charset=utf-8")
         .header("x-trans-id", trans_id.clone())
         .header("x-openstack-request-id", trans_id)
-        .body(Body::from(message))
+        .body(Body::from(message.to_string()))
         .unwrap()
 }
 
