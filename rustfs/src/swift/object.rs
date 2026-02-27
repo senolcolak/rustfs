@@ -15,7 +15,7 @@
 //! Swift object operations
 //!
 //! This module implements Swift object CRUD operations including upload, download,
-//! metadata management, and server-side copy.
+//! metadata management, server-side copy, and HTTP range requests.
 //!
 //! ## Server-Side Copy
 //!
@@ -37,6 +37,17 @@
 //!
 //! The `copy_object` function implements the core copy logic. Handler integration
 //! requires passing request headers to identify copy operations.
+//!
+//! ## Range Requests
+//!
+//! HTTP Range requests allow partial object downloads:
+//!
+//! - `bytes=0-1023` - First 1024 bytes
+//! - `bytes=1000-` - From byte 1000 to end
+//! - `bytes=-500` - Last 500 bytes
+//!
+//! The `parse_range_header` function parses Range headers, and `get_object` accepts
+//! an optional range parameter. See RANGE_REQUESTS.md for details.
 
 use crate::swift::{SwiftError, SwiftResult};
 use crate::swift::account::validate_account_access;
@@ -335,23 +346,32 @@ where
 /// Download an object from Swift storage (GET)
 ///
 /// Maps Swift container/object to S3 bucket/key and retrieves the object content.
-/// Returns the object stream and metadata.
+/// Returns the object stream and metadata. Supports HTTP Range requests.
 ///
 /// # Arguments
 /// * `account` - Swift account name (AUTH_{project_id})
 /// * `container` - Container name
 /// * `object` - Object name
 /// * `credentials` - User credentials with project_id
+/// * `range` - Optional HTTP Range specification (bytes=start-end)
 ///
 /// # Returns
 /// * `Ok((stream, object_info))` - Object content stream and metadata
 /// * `Err(SwiftError)` - Error if validation fails or object not found
+///
+/// # Range Requests
+/// Swift supports standard HTTP Range requests:
+/// - `bytes=0-999` - First 1000 bytes
+/// - `bytes=1000-1999` - Bytes 1000-1999
+/// - `bytes=1000-` - From byte 1000 to end
+/// - `bytes=-500` - Last 500 bytes
 #[allow(dead_code)] // Phase 3: Will be used in handler for GET object operation
 pub async fn get_object(
     account: &str,
     container: &str,
     object: &str,
     credentials: &Credentials,
+    range: Option<rustfs_ecstore::store_api::HTTPRangeSpec>,
 ) -> SwiftResult<rustfs_ecstore::store_api::GetObjectReader> {
     use rustfs_ecstore::store_api::GetObjectReader;
 
@@ -378,9 +398,9 @@ pub async fn get_object(
     // 6. Prepare object options
     let opts = ObjectOptions::default();
 
-    // 7. Get object reader from storage
+    // 7. Get object reader from storage with range support
     let reader: GetObjectReader = store
-        .get_object_reader(&bucket, &s3_key, None, HeaderMap::new(), &opts)
+        .get_object_reader(&bucket, &s3_key, range, HeaderMap::new(), &opts)
         .await
         .map_err(|e| {
             let err_str = e.to_string();
@@ -828,6 +848,130 @@ pub fn parse_copy_from_header(copy_from: &str) -> SwiftResult<(String, String)> 
     parse_destination_header(copy_from)
 }
 
+/// Parse HTTP Range header for Swift
+///
+/// Parses standard HTTP Range header (e.g., "bytes=0-1023") into HTTPRangeSpec.
+/// Swift uses the same Range header format as HTTP/S3.
+///
+/// # Arguments
+/// * `range_str` - The Range header value (e.g., "bytes=0-1023")
+///
+/// # Returns
+/// * `Ok(HTTPRangeSpec)` - Parsed range specification
+/// * `Err(SwiftError)` - Error if format is invalid
+///
+/// # Supported Formats
+/// - `bytes=0-1023` - Bytes 0 through 1023 (inclusive)
+/// - `bytes=1024-` - From byte 1024 to end of file
+/// - `bytes=-500` - Last 500 bytes (suffix range)
+///
+/// # Examples
+/// ```ignore
+/// let range = parse_range_header("bytes=0-1023")?;
+/// assert_eq!(range.start, 0);
+/// assert_eq!(range.end, 1023);
+/// ```
+#[allow(dead_code)] // Phase 3: Will be used when handler supports Range header
+pub fn parse_range_header(range_str: &str) -> SwiftResult<rustfs_ecstore::store_api::HTTPRangeSpec> {
+    use rustfs_ecstore::store_api::HTTPRangeSpec;
+
+    if !range_str.starts_with("bytes=") {
+        return Err(SwiftError::BadRequest(
+            "Range header must start with 'bytes='".to_string()
+        ));
+    }
+
+    let range_part = &range_str[6..]; // Remove "bytes=" prefix
+
+    if let Some(dash_pos) = range_part.find('-') {
+        let start_str = &range_part[..dash_pos];
+        let end_str = &range_part[dash_pos + 1..];
+
+        if start_str.is_empty() && end_str.is_empty() {
+            return Err(SwiftError::BadRequest(
+                "Invalid range format: both start and end are empty".to_string()
+            ));
+        }
+
+        if start_str.is_empty() {
+            // Suffix range: bytes=-500 (last 500 bytes)
+            let length = end_str
+                .parse::<i64>()
+                .map_err(|_| SwiftError::BadRequest("Invalid range format: suffix length not a number".to_string()))?;
+
+            if length <= 0 {
+                return Err(SwiftError::BadRequest(
+                    "Invalid range format: suffix length must be positive".to_string()
+                ));
+            }
+
+            Ok(HTTPRangeSpec {
+                is_suffix_length: true,
+                start: -length,
+                end: -1,
+            })
+        } else {
+            // Regular range or open-ended range
+            let start = start_str
+                .parse::<i64>()
+                .map_err(|_| SwiftError::BadRequest("Invalid range format: start not a number".to_string()))?;
+
+            let end = if end_str.is_empty() {
+                -1 // Open-ended range: bytes=500-
+            } else {
+                end_str
+                    .parse::<i64>()
+                    .map_err(|_| SwiftError::BadRequest("Invalid range format: end not a number".to_string()))?
+            };
+
+            if start < 0 {
+                return Err(SwiftError::BadRequest(
+                    "Invalid range format: start must be non-negative".to_string()
+                ));
+            }
+
+            if end != -1 && end < start {
+                return Err(SwiftError::BadRequest(
+                    "Invalid range format: end must be >= start".to_string()
+                ));
+            }
+
+            Ok(HTTPRangeSpec {
+                is_suffix_length: false,
+                start,
+                end,
+            })
+        }
+    } else {
+        Err(SwiftError::BadRequest(
+            "Invalid range format: missing '-'".to_string()
+        ))
+    }
+}
+
+/// Format Content-Range header for Swift responses
+///
+/// Creates a Content-Range header value for partial content responses.
+/// Format: "bytes start-end/total"
+///
+/// # Arguments
+/// * `start` - Start byte position (inclusive)
+/// * `end` - End byte position (inclusive)
+/// * `total` - Total size of the object
+///
+/// # Returns
+/// * Formatted Content-Range header value
+///
+/// # Example
+/// ```ignore
+/// let header = format_content_range(0, 1023, 5000);
+/// assert_eq!(header, "bytes 0-1023/5000");
+/// ```
+#[allow(dead_code)] // Phase 3: Will be used when handler supports Range header
+pub fn format_content_range(start: i64, end: i64, total: i64) -> String {
+    format!("bytes {}-{}/{}", start, end, total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1035,6 +1179,85 @@ mod tests {
         // Invalid formats (same as destination header)
         assert!(parse_copy_from_header("/container-only").is_err());
         assert!(parse_copy_from_header("").is_err());
+    }
+
+    #[test]
+    fn test_parse_range_header_regular() {
+        // Regular range: bytes=0-1023
+        let range = parse_range_header("bytes=0-1023").unwrap();
+        assert_eq!(range.is_suffix_length, false);
+        assert_eq!(range.start, 0);
+        assert_eq!(range.end, 1023);
+
+        // Another regular range
+        let range = parse_range_header("bytes=1000-1999").unwrap();
+        assert_eq!(range.is_suffix_length, false);
+        assert_eq!(range.start, 1000);
+        assert_eq!(range.end, 1999);
+    }
+
+    #[test]
+    fn test_parse_range_header_open_ended() {
+        // Open-ended range: bytes=1000-
+        let range = parse_range_header("bytes=1000-").unwrap();
+        assert_eq!(range.is_suffix_length, false);
+        assert_eq!(range.start, 1000);
+        assert_eq!(range.end, -1);
+
+        // From start to end
+        let range = parse_range_header("bytes=0-").unwrap();
+        assert_eq!(range.is_suffix_length, false);
+        assert_eq!(range.start, 0);
+        assert_eq!(range.end, -1);
+    }
+
+    #[test]
+    fn test_parse_range_header_suffix() {
+        // Suffix range: bytes=-500 (last 500 bytes)
+        let range = parse_range_header("bytes=-500").unwrap();
+        assert_eq!(range.is_suffix_length, true);
+        assert_eq!(range.start, -500);
+        assert_eq!(range.end, -1);
+
+        // Last 1 byte
+        let range = parse_range_header("bytes=-1").unwrap();
+        assert_eq!(range.is_suffix_length, true);
+        assert_eq!(range.start, -1);
+        assert_eq!(range.end, -1);
+    }
+
+    #[test]
+    fn test_parse_range_header_invalid() {
+        // Missing "bytes=" prefix
+        assert!(parse_range_header("0-1023").is_err());
+        assert!(parse_range_header("range=0-1023").is_err());
+
+        // Missing dash
+        assert!(parse_range_header("bytes=01023").is_err());
+
+        // Both empty
+        assert!(parse_range_header("bytes=-").is_err());
+
+        // End before start
+        assert!(parse_range_header("bytes=1000-999").is_err());
+
+        // Negative start (invalid for regular range)
+        assert!(parse_range_header("bytes=-1000-2000").is_err());
+
+        // Invalid numbers
+        assert!(parse_range_header("bytes=abc-def").is_err());
+        assert!(parse_range_header("bytes=0-xyz").is_err());
+
+        // Zero or negative suffix length
+        assert!(parse_range_header("bytes=-0").is_err());
+    }
+
+    #[test]
+    fn test_format_content_range() {
+        assert_eq!(format_content_range(0, 1023, 5000), "bytes 0-1023/5000");
+        assert_eq!(format_content_range(1000, 1999, 10000), "bytes 1000-1999/10000");
+        assert_eq!(format_content_range(0, 0, 1), "bytes 0-0/1");
+        assert_eq!(format_content_range(9999, 9999, 10000), "bytes 9999-9999/10000");
     }
 
     #[test]
