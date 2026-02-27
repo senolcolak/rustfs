@@ -243,6 +243,19 @@ pub async fn start_http_server(
         b.build()
     };
 
+    // Wrap S3 service with Swift service for OpenStack Swift API support
+    let swift_enabled = std::env::var("RUSTFS_SWIFT_ENABLE")
+        .unwrap_or_else(|_| "false".to_string())
+        .parse()
+        .unwrap_or(false);
+    let swift_url_prefix = std::env::var("RUSTFS_SWIFT_URL_PREFIX").ok();
+
+    let combined_service = crate::swift::SwiftService::new(swift_enabled, swift_url_prefix, s3_service);
+
+    if swift_enabled {
+        info!("Swift API enabled with URL pattern: /v1/AUTH_{{project_id}}");
+    }
+
     // Create shutdown channel
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
     let shutdown_tx_clone = shutdown_tx.clone();
@@ -401,7 +414,7 @@ pub async fn start_http_server(
 
             let connection_ctx = ConnectionContext {
                 http_server: http_server.clone(),
-                s3_service: s3_service.clone(),
+                s3_service: combined_service.clone(),
                 compression_config: compression_config.clone(),
                 is_console,
                 readiness: readiness.clone(),
@@ -522,7 +535,7 @@ async fn setup_tls_acceptor(tls_path: &str) -> Result<Option<TlsAcceptor>> {
 #[derive(Clone)]
 struct ConnectionContext {
     http_server: Arc<ConnBuilder<TokioExecutor>>,
-    s3_service: S3Service,
+    s3_service: crate::swift::SwiftService<S3Service>,
     compression_config: CompressionConfig,
     is_console: bool,
     readiness: Arc<GlobalReadiness>,
