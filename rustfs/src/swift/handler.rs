@@ -111,13 +111,13 @@ async fn handle_swift_request(route: SwiftRoute, credentials: Option<Credentials
                         .map_err(|e| SwiftError::InternalServerError(format!("JSON serialization failed: {}", e)))?;
 
                     let trans_id = generate_trans_id();
-                    Ok(Response::builder()
+                    Response::builder()
                         .status(StatusCode::OK)
                         .header("content-type", "application/json; charset=utf-8")
                         .header("x-trans-id", trans_id.clone())
                         .header("x-openstack-request-id", trans_id)
                         .body(Body::from(json))
-                        .unwrap())
+                        .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))
                 }
                 Method::HEAD => {
                     // Account metadata - Phase 2
@@ -153,14 +153,14 @@ async fn handle_swift_request(route: SwiftRoute, credentials: Option<Credentials
                         StatusCode::ACCEPTED // 202 - Container already exists
                     };
 
-                    Ok(Response::builder()
+                    Response::builder()
                         .status(status)
                         .header("content-type", "text/html; charset=utf-8")
                         .header("content-length", "0")
                         .header("x-trans-id", trans_id.clone())
                         .header("x-openstack-request-id", trans_id)
                         .body(Body::empty())
-                        .unwrap())
+                        .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))
                 }
                 Method::GET => {
                     // List objects in container - Phase 3
@@ -196,7 +196,9 @@ async fn handle_swift_request(route: SwiftRoute, credentials: Option<Credentials
                         response = response.header(header_name, value);
                     }
 
-                    Ok(response.body(Body::empty()).unwrap())
+                    Ok(response
+                        .body(Body::empty())
+                        .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))?)
                 }
                 Method::POST => {
                     // Update container metadata
@@ -206,28 +208,28 @@ async fn handle_swift_request(route: SwiftRoute, credentials: Option<Credentials
                     container::update_container_metadata(&account, &container, &credentials, metadata).await?;
 
                     let trans_id = generate_trans_id();
-                    Ok(Response::builder()
+                    Response::builder()
                         .status(StatusCode::NO_CONTENT)
                         .header("content-type", "text/html; charset=utf-8")
                         .header("content-length", "0")
                         .header("x-trans-id", trans_id.clone())
                         .header("x-openstack-request-id", trans_id)
                         .body(Body::empty())
-                        .unwrap())
+                        .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))
                 }
                 Method::DELETE => {
                     // Delete container
                     container::delete_container(&account, &container, &credentials).await?;
 
                     let trans_id = generate_trans_id();
-                    Ok(Response::builder()
+                    Response::builder()
                         .status(StatusCode::NO_CONTENT)
                         .header("content-type", "text/html; charset=utf-8")
                         .header("content-length", "0")
                         .header("x-trans-id", trans_id.clone())
                         .header("x-openstack-request-id", trans_id)
                         .body(Body::empty())
-                        .unwrap())
+                        .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))
                 }
                 _ => Err(SwiftError::BadRequest(format!("Unsupported method for container: {}", method))),
             }
@@ -250,7 +252,10 @@ async fn handle_swift_request(route: SwiftRoute, credentials: Option<Credentials
 /// Generate a transaction ID for Swift responses
 fn generate_trans_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros();
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| std::time::Duration::from_secs(0))
+        .as_micros();
     format!("tx{:x}", timestamp)
 }
 
@@ -274,7 +279,10 @@ fn swift_error_to_response(error: SwiftError) -> Response<Body> {
         .header("x-trans-id", trans_id.clone())
         .header("x-openstack-request-id", trans_id)
         .body(Body::from(message.to_string()))
-        .unwrap()
+        .unwrap_or_else(|_| {
+            // Fallback response if builder fails
+            Response::new(Body::from("Internal Server Error".to_string()))
+        })
 }
 
 // Tests commented out for Phase 1 - will be fixed in Phase 2 when we have real handlers

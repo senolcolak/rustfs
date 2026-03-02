@@ -58,6 +58,16 @@ use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::store_api::{BucketOperations, BucketOptions, ObjectIO, ObjectOperations, ObjectOptions, PutObjReader};
 use rustfs_rio::{HashReader, Reader, WarpReader};
 use std::collections::HashMap;
+use tracing::error;
+
+/// Maximum number of metadata headers allowed per object (Swift standard)
+const MAX_METADATA_COUNT: usize = 90;
+
+/// Maximum size in bytes for a single metadata value (Swift standard)
+const MAX_METADATA_VALUE_SIZE: usize = 256;
+
+/// Maximum object size in bytes (5GB - Swift default)
+const MAX_OBJECT_SIZE: i64 = 5 * 1024 * 1024 * 1024;
 
 /// Object key translator for Swift object names
 ///
@@ -208,6 +218,50 @@ impl Default for ObjectKeyMapper {
     }
 }
 
+/// Validate metadata against Swift limits
+///
+/// Checks that:
+/// - Total number of metadata entries doesn't exceed MAX_METADATA_COUNT
+/// - Individual metadata values don't exceed MAX_METADATA_VALUE_SIZE
+///
+/// Returns error if limits are exceeded.
+fn validate_metadata(metadata: &HashMap<String, String>) -> SwiftResult<()> {
+    // Check total metadata count
+    if metadata.len() > MAX_METADATA_COUNT {
+        return Err(SwiftError::BadRequest(format!(
+            "Too many metadata headers: {} (max: {})",
+            metadata.len(),
+            MAX_METADATA_COUNT
+        )));
+    }
+
+    // Check individual value sizes
+    for (key, value) in metadata.iter() {
+        if value.len() > MAX_METADATA_VALUE_SIZE {
+            return Err(SwiftError::BadRequest(format!(
+                "Metadata value for '{}' too large: {} bytes (max: {} bytes)",
+                key,
+                value.len(),
+                MAX_METADATA_VALUE_SIZE
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// Sanitize storage layer errors for client responses
+///
+/// Logs detailed error server-side while returning generic message to client.
+/// This prevents information disclosure vulnerabilities.
+fn sanitize_storage_error<E: std::fmt::Display>(operation: &str, error: E) -> SwiftError {
+    // Log detailed error server-side
+    error!("Storage operation '{}' failed: {}", operation, error);
+
+    // Return generic error to client
+    SwiftError::InternalServerError(format!("{} operation failed", operation))
+}
+
 /// Upload an object to Swift storage (PUT)
 ///
 /// Maps Swift container/object to S3 bucket/key and stores the object.
@@ -267,38 +321,49 @@ where
         user_metadata.insert("content-type".to_string(), ct_str.to_string());
     }
 
-    // 7. Get content length from headers (-1 if not provided)
+    // 7. Validate metadata limits
+    validate_metadata(&user_metadata)?;
+
+    // 8. Get content length from headers (-1 if not provided)
     let content_length = headers
         .get("content-length")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<i64>().ok())
         .unwrap_or(-1);
 
-    // 8. Get storage layer
+    // 9. Validate content length doesn't exceed maximum
+    if content_length > MAX_OBJECT_SIZE {
+        return Err(SwiftError::BadRequest(format!(
+            "Object size {} bytes exceeds maximum of {} bytes",
+            content_length, MAX_OBJECT_SIZE
+        )));
+    }
+
+    // 10. Get storage layer
     let Some(store) = new_object_layer_fn() else {
         return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
-    // 8. Verify bucket/container exists
+    // 11. Verify bucket/container exists
     store.get_bucket_info(&bucket, &BucketOptions::default()).await.map_err(|e| {
         if e.to_string().contains("does not exist") {
             SwiftError::NotFound(format!("Container '{}' not found", container))
         } else {
-            SwiftError::InternalServerError(format!("Failed to verify container: {}", e))
+            sanitize_storage_error("Container verification", e)
         }
     })?;
 
-    // 9. Prepare object options with metadata
+    // 12. Prepare object options with metadata
     let opts = ObjectOptions {
         user_defined: user_metadata,
         ..Default::default()
     };
 
-    // 10. Wrap reader in buffered reader then WarpReader (Box<dyn Reader>)
+    // 13. Wrap reader in buffered reader then WarpReader (Box<dyn Reader>)
     let buf_reader = tokio::io::BufReader::new(reader);
     let warp_reader: Box<dyn Reader> = Box::new(WarpReader::new(buf_reader));
 
-    // 11. Create HashReader (no MD5/SHA256 validation for Swift)
+    // 14. Create HashReader (no MD5/SHA256 validation for Swift)
     let hash_reader = HashReader::new(
         warp_reader,
         content_length,
@@ -307,18 +372,18 @@ where
         None,  // sha256hex
         false, // disable_multipart
     )
-    .map_err(|e| SwiftError::InternalServerError(format!("Failed to create hash reader: {}", e)))?;
+    .map_err(|e| sanitize_storage_error("Hash reader creation", e))?;
 
-    // 12. Wrap in PutObjReader as expected by storage layer
+    // 15. Wrap in PutObjReader as expected by storage layer
     let mut put_reader = PutObjReader::new(hash_reader);
 
-    // 13. Upload object to storage
+    // 16. Upload object to storage
     let obj_info = store
         .put_object(&bucket, &s3_key, &mut put_reader, &opts)
         .await
-        .map_err(|e| SwiftError::InternalServerError(format!("Failed to upload object: {}", e)))?;
+        .map_err(|e| sanitize_storage_error("Object upload", e))?;
 
-    // 14. Return ETag (MD5 hash in hex format)
+    // 17. Return ETag (MD5 hash in hex format)
     Ok(obj_info.etag.unwrap_or_default())
 }
 
@@ -384,7 +449,7 @@ pub async fn get_object(
             if err_str.contains("does not exist") || err_str.contains("not found") {
                 SwiftError::NotFound(format!("Object '{}' not found in container '{}'", object, container))
             } else {
-                SwiftError::InternalServerError(format!("Failed to read object: {}", e))
+                sanitize_storage_error("Object read", e)
             }
         })?;
 
@@ -441,7 +506,7 @@ pub async fn head_object(
         if err_str.contains("does not exist") || err_str.contains("not found") {
             SwiftError::NotFound(format!("Object '{}' not found in container '{}'", object, container))
         } else {
-            SwiftError::InternalServerError(format!("Failed to get object metadata: {}", e))
+            sanitize_storage_error("Object metadata retrieval", e)
         }
     })?;
 
@@ -500,7 +565,7 @@ pub async fn delete_object(account: &str, container: &str, object: &str, credent
         if err_str.contains("Bucket not found") || err_str.contains("does not exist") {
             SwiftError::NotFound(format!("Container '{}' not found", container))
         } else {
-            SwiftError::InternalServerError(format!("Failed to delete object: {}", e))
+            sanitize_storage_error("Object deletion", e)
         }
     })?;
 
@@ -556,7 +621,7 @@ pub async fn update_object_metadata(
         if err_str.contains("does not exist") || err_str.contains("not found") {
             SwiftError::NotFound(format!("Object '{}' not found in container '{}'", object, container))
         } else {
-            SwiftError::InternalServerError(format!("Failed to get object info: {}", e))
+            sanitize_storage_error("Object info retrieval", e)
         }
     })?;
 
@@ -586,7 +651,10 @@ pub async fn update_object_metadata(
         new_metadata.insert("content-type".to_string(), ct_str.to_string());
     }
 
-    // 10. Prepare options for metadata update
+    // 10. Validate metadata limits
+    validate_metadata(&new_metadata)?;
+
+    // 11. Prepare options for metadata update
     // Swift POST replaces all custom metadata, not merges
     let update_opts = ObjectOptions {
         user_defined: new_metadata,
@@ -595,11 +663,11 @@ pub async fn update_object_metadata(
         ..Default::default()
     };
 
-    // 11. Update object metadata
+    // 12. Update object metadata
     let _updated_info = store
         .put_object_metadata(&bucket, &s3_key, &update_opts)
         .await
-        .map_err(|e| SwiftError::InternalServerError(format!("Failed to update object metadata: {}", e)))?;
+        .map_err(|e| sanitize_storage_error("Metadata update", e))?;
 
     Ok(())
 }
@@ -680,7 +748,7 @@ pub async fn copy_object(
             if err_str.contains("does not exist") || err_str.contains("not found") {
                 SwiftError::NotFound(format!("Source object '{}' not found in container '{}'", src_object, src_container))
             } else {
-                SwiftError::InternalServerError(format!("Failed to get source object info: {}", e))
+                sanitize_storage_error("Source object info retrieval", e)
             }
         })?;
 
@@ -699,7 +767,7 @@ pub async fn copy_object(
         if err_str.contains("does not exist") || err_str.contains("not found") {
             SwiftError::NotFound(format!("Destination container '{}' not found", dst_container))
         } else {
-            SwiftError::InternalServerError(format!("Failed to check destination container: {}", e))
+            sanitize_storage_error("Destination container verification", e)
         }
     })?;
 
@@ -734,19 +802,22 @@ pub async fn copy_object(
         new_metadata.insert("content-type".to_string(), ct);
     }
 
-    // 13. Prepare destination options
+    // 13. Validate metadata limits
+    validate_metadata(&new_metadata)?;
+
+    // 14. Prepare destination options
     let dst_opts = ObjectOptions {
         user_defined: new_metadata,
         ..Default::default()
     };
 
-    // 14. Perform server-side copy
+    // 15. Perform server-side copy
     let dst_info = store
         .copy_object(&src_bucket, &src_s3_key, &dst_bucket, &dst_s3_key, &mut src_info, &src_opts, &dst_opts)
         .await
-        .map_err(|e| SwiftError::InternalServerError(format!("Failed to copy object: {}", e)))?;
+        .map_err(|e| sanitize_storage_error("Object copy", e))?;
 
-    // 15. Return the ETag of the destination object
+    // 16. Return the ETag of the destination object
     Ok(dst_info.etag.unwrap_or_default())
 }
 

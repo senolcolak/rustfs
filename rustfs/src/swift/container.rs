@@ -24,6 +24,19 @@ use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::store_api::{
     BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, ListOperations, MakeBucketOptions,
 };
+use tracing::error;
+
+/// Sanitize storage layer errors for client responses
+///
+/// Logs detailed error server-side while returning generic message to client.
+/// This prevents information disclosure vulnerabilities.
+fn sanitize_storage_error<E: std::fmt::Display>(operation: &str, error: E) -> SwiftError {
+    // Log detailed error server-side
+    error!("Storage operation '{}' failed: {}", operation, error);
+
+    // Return generic error to client
+    SwiftError::InternalServerError(format!("{} operation failed", operation))
+}
 
 /// Container name translation options
 #[derive(Debug, Clone)]
@@ -151,7 +164,7 @@ pub async fn list_containers(account: &str, credentials: &Credentials) -> SwiftR
     let bucket_infos = store
         .list_bucket(&BucketOptions::default())
         .await
-        .map_err(|e| SwiftError::InternalServerError(format!("Failed to list buckets: {}", e)))?;
+        .map_err(|e| sanitize_storage_error("Container listing", e))?;
 
     // Filter and convert buckets to containers
     let containers: Vec<Container> = bucket_infos
@@ -215,7 +228,7 @@ pub async fn create_container(account: &str, container: &str, credentials: &Cred
             },
         )
         .await
-        .map_err(|e| SwiftError::InternalServerError(format!("Failed to create container: {}", e)))?;
+        .map_err(|e| sanitize_storage_error("Container creation", e))?;
 
     // Container created successfully - return true for 201 Created
     Ok(true)
@@ -296,7 +309,7 @@ pub async fn get_container_metadata(account: &str, container: &str, credentials:
             if e.to_string().contains("not found") || e.to_string().contains("NoSuchBucket") {
                 SwiftError::NotFound(format!("Container '{}' not found", container))
             } else {
-                SwiftError::InternalServerError(format!("Failed to get container metadata: {}", e))
+                sanitize_storage_error("Container metadata retrieval", e)
             }
         })?;
 
@@ -358,7 +371,7 @@ pub async fn update_container_metadata(
             if e.to_string().contains("not found") || e.to_string().contains("NoSuchBucket") {
                 SwiftError::NotFound(format!("Container '{}' not found", container))
             } else {
-                SwiftError::InternalServerError(format!("Failed to get container metadata: {}", e))
+                sanitize_storage_error("Container metadata retrieval", e)
             }
         })?;
 
@@ -412,7 +425,7 @@ pub async fn delete_container(account: &str, container: &str, credentials: &Cred
             if e.to_string().contains("not found") || e.to_string().contains("NoSuchBucket") {
                 SwiftError::NotFound(format!("Container '{}' not found", container))
             } else {
-                SwiftError::InternalServerError(format!("Failed to get container info: {}", e))
+                sanitize_storage_error("Container info retrieval", e)
             }
         })?;
 
@@ -436,7 +449,7 @@ pub async fn delete_container(account: &str, container: &str, credentials: &Cred
             } else if error_msg.contains("not found") || error_msg.contains("NoSuchBucket") {
                 SwiftError::NotFound(format!("Container '{}' not found", container))
             } else {
-                SwiftError::InternalServerError(format!("Failed to delete container: {}", e))
+                sanitize_storage_error("Container deletion", e)
             }
         })?;
 
@@ -497,7 +510,7 @@ pub async fn list_objects(
         if e.to_string().contains("does not exist") {
             SwiftError::NotFound(format!("Container '{}' not found", container))
         } else {
-            SwiftError::InternalServerError(format!("Failed to access container: {}", e))
+            sanitize_storage_error("Container access", e)
         }
     })?;
 
@@ -519,7 +532,7 @@ pub async fn list_objects(
             false, // include_deleted
         )
         .await
-        .map_err(|e| SwiftError::InternalServerError(format!("Failed to list objects: {}", e)))?;
+        .map_err(|e| sanitize_storage_error("Object listing", e))?;
 
     // Convert ObjectInfo to Swift Object format
     let mut swift_objects = Vec::new();
