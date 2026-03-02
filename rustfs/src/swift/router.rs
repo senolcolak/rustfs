@@ -18,8 +18,9 @@ use axum::http::{Method, Uri};
 use once_cell::sync::Lazy;
 use regex::Regex;
 
-/// Regex pattern for Swift account URLs: /v1/AUTH_{uuid}
-static ACCOUNT_PATTERN: Lazy<Regex> = Lazy::new(|| Regex::new(r"^AUTH_([a-f0-9-]+)$").unwrap());
+/// Regex pattern for Swift account URLs: /v1/AUTH_{project_id}
+/// Accepts any non-empty alphanumeric string with hyphens and underscores
+static ACCOUNT_PATTERN: Lazy<Regex> = Lazy::new(|| Regex::new(r"^AUTH_([a-zA-Z0-9_-]+)$").unwrap());
 
 /// Represents a parsed Swift route
 #[derive(Debug, Clone, PartialEq, Eq)]

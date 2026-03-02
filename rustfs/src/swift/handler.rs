@@ -19,6 +19,7 @@
 //! to S3 service for non-Swift requests.
 
 use crate::swift::container;
+use crate::swift::object;
 use crate::swift::{SwiftError, SwiftRoute, SwiftRouter};
 use axum::http::{Method, Request, Response, StatusCode};
 use futures::Future;
@@ -165,11 +166,21 @@ async fn handle_swift_request(route: SwiftRoute, credentials: Option<Credentials
                         .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))
                 }
                 Method::GET => {
-                    // List objects in container - Phase 3
-                    Err(SwiftError::InternalServerError(format!(
-                        "Swift Container GET operation not yet implemented: GET {}/{}",
-                        account, container
-                    )))
+                    // List objects in container
+                    let objects = container::list_objects(&account, &container, &credentials, None, None, None, None).await?;
+
+                    // Generate JSON response
+                    let json = serde_json::to_string(&objects)
+                        .map_err(|e| SwiftError::InternalServerError(format!("JSON serialization failed: {}", e)))?;
+
+                    let trans_id = generate_trans_id();
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "application/json; charset=utf-8")
+                        .header("x-trans-id", trans_id.clone())
+                        .header("x-openstack-request-id", trans_id)
+                        .body(Body::from(json))
+                        .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))
                 }
                 Method::HEAD => {
                     // Container metadata
@@ -204,7 +215,8 @@ async fn handle_swift_request(route: SwiftRoute, credentials: Option<Credentials
                 }
                 Method::POST => {
                     // Update container metadata
-                    // TODO: Extract metadata from request headers
+                    // Note: Currently sends empty metadata because handler doesn't have access to request headers
+                    // TODO: Refactor handler to pass headers for metadata extraction (X-Container-Meta-*)
                     let metadata = std::collections::HashMap::new();
 
                     container::update_container_metadata(&account, &container, &credentials, metadata).await?;
@@ -242,11 +254,84 @@ async fn handle_swift_request(route: SwiftRoute, credentials: Option<Credentials
             object,
             method,
         } => {
-            // Phase 3: Object operations
-            Err(SwiftError::InternalServerError(format!(
-                "Swift Object operation not yet implemented: {} {}/{}/{}",
-                method, account, container, object
-            )))
+            match method {
+                Method::PUT => {
+                    // Upload object
+                    // Note: Currently cannot handle request body in this handler signature
+                    // TODO: Refactor handler to accept request body for object upload
+                    Err(SwiftError::InternalServerError(
+                        "Object PUT not yet integrated with handler (requires request body access)".to_string(),
+                    ))
+                }
+                Method::GET => {
+                    // Download object
+                    // Note: Currently cannot handle Range header
+                    // TODO: Parse Range header and pass to get_object
+                    let _reader = object::get_object(&account, &container, &object, &credentials, None).await?;
+
+                    let trans_id = generate_trans_id();
+                    // Note: This is simplified - real implementation needs to stream the body
+                    // and set proper Content-Length, Content-Type, ETag headers from ObjectInfo
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("x-trans-id", trans_id.clone())
+                        .header("x-openstack-request-id", trans_id)
+                        .body(Body::empty()) // TODO: Stream actual object data
+                        .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))
+                }
+                Method::HEAD => {
+                    // Get object metadata
+                    let info = object::head_object(&account, &container, &object, &credentials).await?;
+
+                    let trans_id = generate_trans_id();
+                    let mut response = Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", info.content_type.as_deref().unwrap_or("application/octet-stream"))
+                        .header("content-length", info.size.to_string())
+                        .header("x-trans-id", trans_id.clone())
+                        .header("x-openstack-request-id", trans_id);
+
+                    // Add ETag if available
+                    if let Some(etag) = info.etag {
+                        response = response.header("etag", etag);
+                    }
+
+                    // Add custom metadata headers (X-Object-Meta-*)
+                    for (key, value) in info.user_defined {
+                        if key != "content-type" {
+                            let header_name = format!("x-object-meta-{}", key);
+                            response = response.header(header_name, value);
+                        }
+                    }
+
+                    response
+                        .body(Body::empty())
+                        .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))
+                }
+                Method::POST => {
+                    // Update object metadata
+                    // Note: Currently sends empty headers because handler doesn't have access to request headers
+                    // TODO: Refactor handler to pass headers for metadata extraction (X-Object-Meta-*)
+                    Err(SwiftError::InternalServerError(
+                        "Object POST not yet integrated with handler (requires request headers access)".to_string(),
+                    ))
+                }
+                Method::DELETE => {
+                    // Delete object
+                    object::delete_object(&account, &container, &object, &credentials).await?;
+
+                    let trans_id = generate_trans_id();
+                    Response::builder()
+                        .status(StatusCode::NO_CONTENT)
+                        .header("content-type", "text/html; charset=utf-8")
+                        .header("content-length", "0")
+                        .header("x-trans-id", trans_id.clone())
+                        .header("x-openstack-request-id", trans_id)
+                        .body(Body::empty())
+                        .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))
+                }
+                _ => Err(SwiftError::BadRequest(format!("Unsupported method for object: {}", method))),
+            }
         }
     }
 }
