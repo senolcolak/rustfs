@@ -23,6 +23,7 @@ use crate::swift::{SwiftError, SwiftRoute, SwiftRouter};
 use axum::http::{Method, Request, Response, StatusCode};
 use futures::Future;
 use rustfs_credentials::Credentials;
+use rustfs_keystone::KEYSTONE_CREDENTIALS;
 use s3s::Body;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -71,8 +72,9 @@ where
         if let Some(route) = router.route(&uri, method.clone()) {
             debug!("Swift route matched: {:?}", route);
 
-            // Extract credentials from request if available
-            let credentials = req.extensions().get::<Credentials>().cloned();
+            // Extract credentials from Keystone task-local storage (if available)
+            // This is consistent with how S3 auth handler retrieves Keystone credentials
+            let credentials = KEYSTONE_CREDENTIALS.try_with(|creds| creds.clone()).ok().flatten();
 
             // Handle Swift operations based on route and method
             let response_future = handle_swift_request(route, credentials);
