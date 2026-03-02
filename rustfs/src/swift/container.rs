@@ -43,7 +43,7 @@ fn sanitize_storage_error<E: std::fmt::Display>(operation: &str, error: E) -> Sw
 pub struct ContainerMapperConfig {
     /// Enable tenant prefixing for bucket names
     /// When true, Swift container names are prefixed with project_id
-    /// Example: container "mycontainer" for project "abc123" becomes bucket "abc123:mycontainer"
+    /// Example: container "mycontainer" for project "abc123" becomes bucket "abc123-mycontainer"
     pub tenant_prefix_enabled: bool,
 }
 
@@ -75,13 +75,13 @@ impl ContainerMapper {
     /// Convert Swift container name to S3 bucket name
     ///
     /// When tenant_prefix_enabled is true:
-    ///   container="mycontainer", project_id="abc123" -> "abc123:mycontainer"
+    ///   container="mycontainer", project_id="abc123" -> "abc123-mycontainer"
     /// When tenant_prefix_enabled is false:
     ///   container="mycontainer", project_id="abc123" -> "mycontainer"
     #[allow(dead_code)] // Phase 2: Will be used in create/delete container operations
     pub fn swift_to_s3_bucket(&self, container: &str, project_id: &str) -> String {
         if self.config.tenant_prefix_enabled {
-            format!("{}:{}", project_id, container)
+            format!("{}-{}", project_id, container)
         } else {
             container.to_string()
         }
@@ -90,14 +90,14 @@ impl ContainerMapper {
     /// Convert S3 bucket name to Swift container name
     ///
     /// When tenant_prefix_enabled is true:
-    ///   bucket="abc123:mycontainer", project_id="abc123" -> "mycontainer"
+    ///   bucket="abc123-mycontainer", project_id="abc123" -> "mycontainer"
     /// When tenant_prefix_enabled is false:
     ///   bucket="mycontainer", project_id="abc123" -> "mycontainer"
     ///
     /// Returns None if bucket doesn't belong to this tenant
     pub fn s3_to_swift_container(&self, bucket: &str, project_id: &str) -> Option<String> {
         if self.config.tenant_prefix_enabled {
-            let prefix = format!("{}:", project_id);
+            let prefix = format!("{}-", project_id);
             bucket.strip_prefix(&prefix).map(|container| container.to_string())
         } else {
             Some(bucket.to_string())
@@ -107,7 +107,7 @@ impl ContainerMapper {
     /// Check if a bucket belongs to the specified project
     pub fn bucket_belongs_to_project(&self, bucket: &str, project_id: &str) -> bool {
         if self.config.tenant_prefix_enabled {
-            bucket.starts_with(&format!("{}:", project_id))
+            bucket.starts_with(&format!("{}-", project_id))
         } else {
             // Without tenant prefixing, we can't determine ownership from name alone
             true
@@ -577,7 +577,7 @@ mod tests {
         });
 
         let bucket = mapper.swift_to_s3_bucket("mycontainer", "abc123");
-        assert_eq!(bucket, "abc123:mycontainer");
+        assert_eq!(bucket, "abc123-mycontainer");
     }
 
     #[test]
@@ -596,11 +596,11 @@ mod tests {
             tenant_prefix_enabled: true,
         });
 
-        let container = mapper.s3_to_swift_container("abc123:mycontainer", "abc123");
+        let container = mapper.s3_to_swift_container("abc123-mycontainer", "abc123");
         assert_eq!(container, Some("mycontainer".to_string()));
 
         // Different tenant should return None
-        let container = mapper.s3_to_swift_container("abc123:mycontainer", "xyz789");
+        let container = mapper.s3_to_swift_container("abc123-mycontainer", "xyz789");
         assert_eq!(container, None);
     }
 
@@ -620,8 +620,8 @@ mod tests {
             tenant_prefix_enabled: true,
         });
 
-        assert!(mapper.bucket_belongs_to_project("abc123:mycontainer", "abc123"));
-        assert!(!mapper.bucket_belongs_to_project("xyz789:mycontainer", "abc123"));
+        assert!(mapper.bucket_belongs_to_project("abc123-mycontainer", "abc123"));
+        assert!(!mapper.bucket_belongs_to_project("xyz789-mycontainer", "abc123"));
         assert!(!mapper.bucket_belongs_to_project("mycontainer", "abc123"));
     }
 
@@ -632,7 +632,7 @@ mod tests {
         });
 
         let info = BucketInfo {
-            name: "abc123:mycontainer".to_string(),
+            name: "abc123-mycontainer".to_string(),
             created: Some(OffsetDateTime::now_utc()),
             deleted: None,
             versioning: false,
@@ -655,7 +655,7 @@ mod tests {
         });
 
         let info = BucketInfo {
-            name: "abc123:mycontainer".to_string(),
+            name: "abc123-mycontainer".to_string(),
             created: Some(OffsetDateTime::now_utc()),
             deleted: None,
             versioning: false,

@@ -154,11 +154,18 @@ mod tests {
 
     #[test]
     fn test_account_pattern() {
+        // Valid UUID-style project IDs
         assert!(ACCOUNT_PATTERN.is_match("AUTH_7188e165c0ae4424ac68ae2e89a05c50"));
         assert!(ACCOUNT_PATTERN.is_match("AUTH_550e8400-e29b-41d4-a716-446655440000"));
-        assert!(!ACCOUNT_PATTERN.is_match("AUTH_"));
-        assert!(!ACCOUNT_PATTERN.is_match("AUTH_invalid"));
-        assert!(!ACCOUNT_PATTERN.is_match("7188e165c0ae4424ac68ae2e89a05c50"));
+
+        // Valid alphanumeric project IDs (non-UUID)
+        assert!(ACCOUNT_PATTERN.is_match("AUTH_project123"));
+        assert!(ACCOUNT_PATTERN.is_match("AUTH_my-project_01"));
+
+        // Invalid patterns
+        assert!(!ACCOUNT_PATTERN.is_match("AUTH_")); // Empty project ID
+        assert!(!ACCOUNT_PATTERN.is_match("7188e165c0ae4424ac68ae2e89a05c50")); // Missing AUTH_ prefix
+        assert!(!ACCOUNT_PATTERN.is_match("AUTH_project with spaces")); // Spaces not allowed
     }
 
     #[test]

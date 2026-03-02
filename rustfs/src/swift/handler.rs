@@ -265,18 +265,21 @@ async fn handle_swift_request(route: SwiftRoute, credentials: Option<Credentials
                 }
                 Method::GET => {
                     // Download object
-                    // Note: Currently cannot handle Range header
-                    // TODO: Parse Range header and pass to get_object
+                    // Note: Handler architecture doesn't support streaming response bodies
+                    // The get_object function returns a stream, but this handler can only return Body::from(String)
+                    // TODO: Refactor handler to accept Request<B> and return streaming Response<Body>
+                    // This requires changing handler signature from:
+                    //   handle_swift_request(route, credentials)
+                    // to:
+                    //   handle_swift_request(req: Request<B>, route, credentials)
                     let _reader = object::get_object(&account, &container, &object, &credentials, None).await?;
 
                     let trans_id = generate_trans_id();
-                    // Note: This is simplified - real implementation needs to stream the body
-                    // and set proper Content-Length, Content-Type, ETag headers from ObjectInfo
                     Response::builder()
                         .status(StatusCode::OK)
                         .header("x-trans-id", trans_id.clone())
                         .header("x-openstack-request-id", trans_id)
-                        .body(Body::empty()) // TODO: Stream actual object data
+                        .body(Body::empty()) // Cannot stream - requires handler refactoring
                         .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))
                 }
                 Method::HEAD => {
@@ -329,6 +332,15 @@ async fn handle_swift_request(route: SwiftRoute, credentials: Option<Credentials
                         .header("x-openstack-request-id", trans_id)
                         .body(Body::empty())
                         .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))
+                }
+                // COPY method for server-side copy
+                m if m == Method::from_bytes(b"COPY").unwrap_or(Method::GET) && m.as_str() == "COPY" => {
+                    // Server-side object copy
+                    // Note: Requires access to Destination header from request
+                    // TODO: Refactor handler to pass headers for copy destination parsing
+                    Err(SwiftError::InternalServerError(
+                        "Object COPY not yet integrated with handler (requires request headers access)".to_string(),
+                    ))
                 }
                 _ => Err(SwiftError::BadRequest(format!("Unsupported method for object: {}", method))),
             }
