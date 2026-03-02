@@ -16,12 +16,14 @@
 //!
 //! This module implements Swift container CRUD operations and container-bucket translation.
 
-use crate::swift::{SwiftError, SwiftResult};
 use crate::swift::account::validate_account_access;
 use crate::swift::types::Container;
+use crate::swift::{SwiftError, SwiftResult};
 use rustfs_credentials::Credentials;
 use rustfs_ecstore::new_object_layer_fn;
-use rustfs_ecstore::store_api::{BucketInfo, BucketOptions, DeleteBucketOptions, MakeBucketOptions, StorageAPI};
+use rustfs_ecstore::store_api::{
+    BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, ListOperations, MakeBucketOptions,
+};
 
 /// Container name translation options
 #[derive(Debug, Clone)]
@@ -107,11 +109,7 @@ impl ContainerMapper {
 /// - count: Number of objects (not available in BucketInfo, set to 0)
 /// - bytes: Total bytes (not available in BucketInfo, set to 0)
 /// - last_modified: ISO 8601 timestamp from created date
-pub fn bucket_info_to_container(
-    info: &BucketInfo,
-    mapper: &ContainerMapper,
-    project_id: &str,
-) -> Option<Container> {
+pub fn bucket_info_to_container(info: &BucketInfo, mapper: &ContainerMapper, project_id: &str) -> Option<Container> {
     // Extract container name (removing tenant prefix if applicable)
     let container_name = mapper.s3_to_swift_container(&info.name, project_id)?;
 
@@ -137,10 +135,7 @@ pub fn bucket_info_to_container(
 /// 3. Filters to buckets belonging to this tenant (using tenant prefix)
 /// 4. Converts BucketInfo to Swift Container format
 #[allow(dead_code)] // Phase 2: Will be used by handler in list containers operation
-pub async fn list_containers(
-    account: &str,
-    credentials: &Credentials,
-) -> SwiftResult<Vec<Container>> {
+pub async fn list_containers(account: &str, credentials: &Credentials) -> SwiftResult<Vec<Container>> {
     // Validate account access and extract project_id
     let project_id = validate_account_access(account, credentials)?;
 
@@ -149,18 +144,14 @@ pub async fn list_containers(
 
     // Get storage layer
     let Some(store) = new_object_layer_fn() else {
-        return Err(SwiftError::InternalServerError(
-            "Storage layer not initialized".to_string(),
-        ));
+        return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
     // List all buckets
     let bucket_infos = store
         .list_bucket(&BucketOptions::default())
         .await
-        .map_err(|e| {
-            SwiftError::InternalServerError(format!("Failed to list buckets: {}", e))
-        })?;
+        .map_err(|e| SwiftError::InternalServerError(format!("Failed to list buckets: {}", e)))?;
 
     // Filter and convert buckets to containers
     let containers: Vec<Container> = bucket_infos
@@ -185,11 +176,7 @@ pub async fn list_containers(
 /// - Returns 202 Accepted if container already exists
 /// - Returns 400 Bad Request for invalid container names
 #[allow(dead_code)] // Phase 2: Will be used by handler
-pub async fn create_container(
-    account: &str,
-    container: &str,
-    credentials: &Credentials,
-) -> SwiftResult<bool> {
+pub async fn create_container(account: &str, container: &str, credentials: &Credentials) -> SwiftResult<bool> {
     // Validate account access and extract project_id
     let project_id = validate_account_access(account, credentials)?;
 
@@ -204,16 +191,11 @@ pub async fn create_container(
 
     // Get storage layer
     let Some(store) = new_object_layer_fn() else {
-        return Err(SwiftError::InternalServerError(
-            "Storage layer not initialized".to_string(),
-        ));
+        return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
     // Check if bucket already exists
-    let bucket_exists = store
-        .get_bucket_info(&bucket_name, &BucketOptions::default())
-        .await
-        .is_ok();
+    let bucket_exists = store.get_bucket_info(&bucket_name, &BucketOptions::default()).await.is_ok();
 
     if bucket_exists {
         // Container already exists - Swift returns 202 Accepted
@@ -233,9 +215,7 @@ pub async fn create_container(
             },
         )
         .await
-        .map_err(|e| {
-            SwiftError::InternalServerError(format!("Failed to create container: {}", e))
-        })?;
+        .map_err(|e| SwiftError::InternalServerError(format!("Failed to create container: {}", e)))?;
 
     // Container created successfully - return true for 201 Created
     Ok(true)
@@ -249,21 +229,15 @@ pub async fn create_container(
 /// - Not be empty
 fn validate_container_name(container: &str) -> SwiftResult<()> {
     if container.is_empty() {
-        return Err(SwiftError::BadRequest(
-            "Container name cannot be empty".to_string(),
-        ));
+        return Err(SwiftError::BadRequest("Container name cannot be empty".to_string()));
     }
 
     if container.len() > 256 {
-        return Err(SwiftError::BadRequest(
-            "Container name too long (max 256 characters)".to_string(),
-        ));
+        return Err(SwiftError::BadRequest("Container name too long (max 256 characters)".to_string()));
     }
 
     if container.contains('/') {
-        return Err(SwiftError::BadRequest(
-            "Container name cannot contain '/'".to_string(),
-        ));
+        return Err(SwiftError::BadRequest("Container name cannot contain '/'".to_string()));
     }
 
     Ok(())
@@ -295,11 +269,7 @@ pub struct ContainerMetadata {
 /// - Returns 204 No Content on success with headers
 /// - Returns 404 Not Found if container doesn't exist
 #[allow(dead_code)] // Phase 2: Will be used by handler
-pub async fn get_container_metadata(
-    account: &str,
-    container: &str,
-    credentials: &Credentials,
-) -> SwiftResult<ContainerMetadata> {
+pub async fn get_container_metadata(account: &str, container: &str, credentials: &Credentials) -> SwiftResult<ContainerMetadata> {
     // Validate account access and extract project_id
     let project_id = validate_account_access(account, credentials)?;
 
@@ -314,9 +284,7 @@ pub async fn get_container_metadata(
 
     // Get storage layer
     let Some(store) = new_object_layer_fn() else {
-        return Err(SwiftError::InternalServerError(
-            "Storage layer not initialized".to_string(),
-        ));
+        return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
     // Get bucket info
@@ -379,9 +347,7 @@ pub async fn update_container_metadata(
 
     // Get storage layer
     let Some(store) = new_object_layer_fn() else {
-        return Err(SwiftError::InternalServerError(
-            "Storage layer not initialized".to_string(),
-        ));
+        return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
     // Verify container exists
@@ -420,11 +386,7 @@ pub async fn update_container_metadata(
 /// - Returns 404 Not Found if container doesn't exist
 /// - Returns 409 Conflict if container is not empty
 #[allow(dead_code)] // Phase 2: Will be used by handler
-pub async fn delete_container(
-    account: &str,
-    container: &str,
-    credentials: &Credentials,
-) -> SwiftResult<()> {
+pub async fn delete_container(account: &str, container: &str, credentials: &Credentials) -> SwiftResult<()> {
     // Validate account access and extract project_id
     let project_id = validate_account_access(account, credentials)?;
 
@@ -439,9 +401,7 @@ pub async fn delete_container(
 
     // Get storage layer
     let Some(store) = new_object_layer_fn() else {
-        return Err(SwiftError::InternalServerError(
-            "Storage layer not initialized".to_string(),
-        ));
+        return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
     // Verify container exists first
@@ -472,10 +432,7 @@ pub async fn delete_container(
             let error_msg = e.to_string();
             // Check if bucket is not empty
             if error_msg.contains("not empty") || error_msg.contains("BucketNotEmpty") {
-                SwiftError::Conflict(format!(
-                    "Container '{}' is not empty. Delete all objects first.",
-                    container
-                ))
+                SwiftError::Conflict(format!("Container '{}' is not empty. Delete all objects first.", container))
             } else if error_msg.contains("not found") || error_msg.contains("NoSuchBucket") {
                 SwiftError::NotFound(format!("Container '{}' not found", container))
             } else {
@@ -532,25 +489,20 @@ pub async fn list_objects(
 
     // Get storage layer
     let Some(store) = new_object_layer_fn() else {
-        return Err(SwiftError::InternalServerError(
-            "Storage layer not initialized".to_string()
-        ));
+        return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
     // Verify bucket exists
-    store
-        .get_bucket_info(&bucket, &BucketOptions::default())
-        .await
-        .map_err(|e| {
-            if e.to_string().contains("does not exist") {
-                SwiftError::NotFound(format!("Container '{}' not found", container))
-            } else {
-                SwiftError::InternalServerError(format!("Failed to access container: {}", e))
-            }
-        })?;
+    store.get_bucket_info(&bucket, &BucketOptions::default()).await.map_err(|e| {
+        if e.to_string().contains("does not exist") {
+            SwiftError::NotFound(format!("Container '{}' not found", container))
+        } else {
+            SwiftError::InternalServerError(format!("Failed to access container: {}", e))
+        }
+    })?;
 
     // Prepare list parameters
-    let max_keys = limit.unwrap_or(10000).max(0) as i32;
+    let max_keys = limit.unwrap_or(10000).max(0);
     let prefix_str = prefix.unwrap_or_default();
     let delimiter_opt = delimiter.filter(|d| !d.is_empty());
 
@@ -567,9 +519,7 @@ pub async fn list_objects(
             false, // include_deleted
         )
         .await
-        .map_err(|e| {
-            SwiftError::InternalServerError(format!("Failed to list objects: {}", e))
-        })?;
+        .map_err(|e| SwiftError::InternalServerError(format!("Failed to list objects: {}", e)))?;
 
     // Convert ObjectInfo to Swift Object format
     let mut swift_objects = Vec::new();
@@ -592,7 +542,9 @@ pub async fn list_objects(
             name: obj_info.name,
             hash: obj_info.etag.unwrap_or_default(),
             bytes: obj_info.size as u64,
-            content_type: obj_info.content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
+            content_type: obj_info
+                .content_type
+                .unwrap_or_else(|| "application/octet-stream".to_string()),
             last_modified,
         });
     }

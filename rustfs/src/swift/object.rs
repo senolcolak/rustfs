@@ -49,13 +49,13 @@
 //! The `parse_range_header` function parses Range headers, and `get_object` accepts
 //! an optional range parameter. See RANGE_REQUESTS.md for details.
 
-use crate::swift::{SwiftError, SwiftResult};
 use crate::swift::account::validate_account_access;
 use crate::swift::container::ContainerMapper;
+use crate::swift::{SwiftError, SwiftResult};
 use axum::http::HeaderMap;
 use rustfs_credentials::Credentials;
 use rustfs_ecstore::new_object_layer_fn;
-use rustfs_ecstore::store_api::{BucketOptions, ObjectIO, ObjectOptions, PutObjReader, StorageAPI};
+use rustfs_ecstore::store_api::{BucketOperations, BucketOptions, ObjectIO, ObjectOperations, ObjectOptions, PutObjReader};
 use rustfs_rio::{HashReader, Reader, WarpReader};
 use std::collections::HashMap;
 
@@ -84,21 +84,15 @@ impl ObjectKeyMapper {
     #[allow(dead_code)] // Phase 3: Will be used in object operations
     pub fn validate_object_name(object: &str) -> SwiftResult<()> {
         if object.is_empty() {
-            return Err(SwiftError::BadRequest(
-                "Object name cannot be empty".to_string(),
-            ));
+            return Err(SwiftError::BadRequest("Object name cannot be empty".to_string()));
         }
 
         if object.len() > 1024 {
-            return Err(SwiftError::BadRequest(
-                "Object name too long (max 1024 bytes)".to_string(),
-            ));
+            return Err(SwiftError::BadRequest("Object name too long (max 1024 bytes)".to_string()));
         }
 
         if object.contains('\0') {
-            return Err(SwiftError::BadRequest(
-                "Object name cannot contain null bytes".to_string(),
-            ));
+            return Err(SwiftError::BadRequest("Object name cannot contain null bytes".to_string()));
         }
 
         // Check for directory traversal attempts
@@ -106,9 +100,7 @@ impl ObjectKeyMapper {
             // Allow ".." as part of a filename, but not as a path segment
             for segment in object.split('/') {
                 if segment == ".." {
-                    return Err(SwiftError::BadRequest(
-                        "Object name cannot contain '..' path segments".to_string(),
-                    ));
+                    return Err(SwiftError::BadRequest("Object name cannot contain '..' path segments".to_string()));
                 }
             }
         }
@@ -164,8 +156,7 @@ impl ObjectKeyMapper {
     #[allow(dead_code)] // Phase 3: Will be used in object operations
     pub fn decode_object_from_url(encoded: &str) -> SwiftResult<String> {
         // Decode percent-encoding
-        let decoded = urlencoding::decode(encoded)
-            .map_err(|e| SwiftError::BadRequest(format!("Invalid URL encoding: {}", e)))?;
+        let decoded = urlencoding::decode(encoded).map_err(|e| SwiftError::BadRequest(format!("Invalid URL encoding: {}", e)))?;
 
         Self::validate_object_name(&decoded)?;
         Ok(decoded.to_string())
@@ -198,10 +189,7 @@ impl ObjectKeyMapper {
         let segments: Vec<&str> = object.split('/').collect();
         let has_trailing_slash = object.ends_with('/');
 
-        let normalized_segments: Vec<&str> = segments
-            .into_iter()
-            .filter(|s| !s.is_empty())
-            .collect();
+        let normalized_segments: Vec<&str> = segments.into_iter().filter(|s| !s.is_empty()).collect();
 
         let mut result = normalized_segments.join("/");
 
@@ -265,19 +253,18 @@ where
     let mut user_metadata = HashMap::new();
     for (header_name, header_value) in headers.iter() {
         let header_str = header_name.as_str().to_lowercase();
-        if header_str.starts_with("x-object-meta-") {
-            let meta_key = &header_str[14..]; // Remove "x-object-meta-" prefix
-            if let Ok(value_str) = header_value.to_str() {
-                user_metadata.insert(meta_key.to_string(), value_str.to_string());
-            }
+        if let Some(meta_key) = header_str.strip_prefix("x-object-meta-")
+            && let Ok(value_str) = header_value.to_str()
+        {
+            user_metadata.insert(meta_key.to_string(), value_str.to_string());
         }
     }
 
     // 6. Extract Content-Type if provided
-    if let Some(content_type) = headers.get("content-type") {
-        if let Ok(ct_str) = content_type.to_str() {
-            user_metadata.insert("content-type".to_string(), ct_str.to_string());
-        }
+    if let Some(content_type) = headers.get("content-type")
+        && let Ok(ct_str) = content_type.to_str()
+    {
+        user_metadata.insert("content-type".to_string(), ct_str.to_string());
     }
 
     // 7. Get content length from headers (-1 if not provided)
@@ -289,29 +276,23 @@ where
 
     // 8. Get storage layer
     let Some(store) = new_object_layer_fn() else {
-        return Err(SwiftError::InternalServerError(
-            "Storage layer not initialized".to_string()
-        ));
+        return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
     // 8. Verify bucket/container exists
-    store
-        .get_bucket_info(&bucket, &BucketOptions::default())
-        .await
-        .map_err(|e| {
-            if e.to_string().contains("does not exist") {
-                SwiftError::NotFound(format!("Container '{}' not found", container))
-            } else {
-                SwiftError::InternalServerError(format!(
-                    "Failed to verify container: {}",
-                    e
-                ))
-            }
-        })?;
+    store.get_bucket_info(&bucket, &BucketOptions::default()).await.map_err(|e| {
+        if e.to_string().contains("does not exist") {
+            SwiftError::NotFound(format!("Container '{}' not found", container))
+        } else {
+            SwiftError::InternalServerError(format!("Failed to verify container: {}", e))
+        }
+    })?;
 
     // 9. Prepare object options with metadata
-    let mut opts = ObjectOptions::default();
-    opts.user_defined = user_metadata;
+    let opts = ObjectOptions {
+        user_defined: user_metadata,
+        ..Default::default()
+    };
 
     // 10. Wrap reader in buffered reader then WarpReader (Box<dyn Reader>)
     let buf_reader = tokio::io::BufReader::new(reader);
@@ -335,9 +316,7 @@ where
     let obj_info = store
         .put_object(&bucket, &s3_key, &mut put_reader, &opts)
         .await
-        .map_err(|e| {
-            SwiftError::InternalServerError(format!("Failed to upload object: {}", e))
-        })?;
+        .map_err(|e| SwiftError::InternalServerError(format!("Failed to upload object: {}", e)))?;
 
     // 14. Return ETag (MD5 hash in hex format)
     Ok(obj_info.etag.unwrap_or_default())
@@ -390,9 +369,7 @@ pub async fn get_object(
 
     // 5. Get storage layer
     let Some(store) = new_object_layer_fn() else {
-        return Err(SwiftError::InternalServerError(
-            "Storage layer not initialized".to_string()
-        ));
+        return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
     // 6. Prepare object options
@@ -452,30 +429,28 @@ pub async fn head_object(
 
     // 5. Get storage layer
     let Some(store) = new_object_layer_fn() else {
-        return Err(SwiftError::InternalServerError(
-            "Storage layer not initialized".to_string()
-        ));
+        return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
     // 6. Prepare object options
     let opts = ObjectOptions::default();
 
     // 7. Get object info (metadata only) from storage
-    let info: ObjectInfo = store
-        .get_object_info(&bucket, &s3_key, &opts)
-        .await
-        .map_err(|e| {
-            let err_str = e.to_string();
-            if err_str.contains("does not exist") || err_str.contains("not found") {
-                SwiftError::NotFound(format!("Object '{}' not found in container '{}'", object, container))
-            } else {
-                SwiftError::InternalServerError(format!("Failed to get object metadata: {}", e))
-            }
-        })?;
+    let info: ObjectInfo = store.get_object_info(&bucket, &s3_key, &opts).await.map_err(|e| {
+        let err_str = e.to_string();
+        if err_str.contains("does not exist") || err_str.contains("not found") {
+            SwiftError::NotFound(format!("Object '{}' not found in container '{}'", object, container))
+        } else {
+            SwiftError::InternalServerError(format!("Failed to get object metadata: {}", e))
+        }
+    })?;
 
     // 8. Check if this is a delete marker
     if info.delete_marker {
-        return Err(SwiftError::NotFound(format!("Object '{}' not found in container '{}'", object, container)));
+        return Err(SwiftError::NotFound(format!(
+            "Object '{}' not found in container '{}'",
+            object, container
+        )));
     }
 
     Ok(info)
@@ -496,12 +471,7 @@ pub async fn head_object(
 /// * `Ok(())` - Object deleted successfully (or didn't exist)
 /// * `Err(SwiftError)` - Error if validation fails or deletion fails
 #[allow(dead_code)] // Phase 3: Will be used in handler for DELETE object operation
-pub async fn delete_object(
-    account: &str,
-    container: &str,
-    object: &str,
-    credentials: &Credentials,
-) -> SwiftResult<()> {
+pub async fn delete_object(account: &str, container: &str, object: &str, credentials: &Credentials) -> SwiftResult<()> {
     // 1. Validate account access and get project_id
     let project_id = validate_account_access(account, credentials)?;
 
@@ -517,9 +487,7 @@ pub async fn delete_object(
 
     // 5. Get storage layer
     let Some(store) = new_object_layer_fn() else {
-        return Err(SwiftError::InternalServerError(
-            "Storage layer not initialized".to_string()
-        ));
+        return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
     // 6. Prepare object options for deletion
@@ -527,17 +495,14 @@ pub async fn delete_object(
 
     // 7. Delete object from storage
     // Swift DELETE is idempotent - returns success even if object doesn't exist
-    let _result = store
-        .delete_object(&bucket, &s3_key, opts)
-        .await
-        .map_err(|e| {
-            let err_str = e.to_string();
-            if err_str.contains("Bucket not found") || err_str.contains("does not exist") {
-                SwiftError::NotFound(format!("Container '{}' not found", container))
-            } else {
-                SwiftError::InternalServerError(format!("Failed to delete object: {}", e))
-            }
-        })?;
+    let _result = store.delete_object(&bucket, &s3_key, opts).await.map_err(|e| {
+        let err_str = e.to_string();
+        if err_str.contains("Bucket not found") || err_str.contains("does not exist") {
+            SwiftError::NotFound(format!("Container '{}' not found", container))
+        } else {
+            SwiftError::InternalServerError(format!("Failed to delete object: {}", e))
+        }
+    })?;
 
     // 8. Swift DELETE is idempotent - always return success
     Ok(())
@@ -581,63 +546,60 @@ pub async fn update_object_metadata(
 
     // 5. Get storage layer
     let Some(store) = new_object_layer_fn() else {
-        return Err(SwiftError::InternalServerError(
-            "Storage layer not initialized".to_string()
-        ));
+        return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
     // 6. First, get the existing object info to verify it exists
     let opts = ObjectOptions::default();
-    let existing_info = store
-        .get_object_info(&bucket, &s3_key, &opts)
-        .await
-        .map_err(|e| {
-            let err_str = e.to_string();
-            if err_str.contains("does not exist") || err_str.contains("not found") {
-                SwiftError::NotFound(format!("Object '{}' not found in container '{}'", object, container))
-            } else {
-                SwiftError::InternalServerError(format!("Failed to get object info: {}", e))
-            }
-        })?;
+    let existing_info = store.get_object_info(&bucket, &s3_key, &opts).await.map_err(|e| {
+        let err_str = e.to_string();
+        if err_str.contains("does not exist") || err_str.contains("not found") {
+            SwiftError::NotFound(format!("Object '{}' not found in container '{}'", object, container))
+        } else {
+            SwiftError::InternalServerError(format!("Failed to get object info: {}", e))
+        }
+    })?;
 
     // 7. Check if this is a delete marker
     if existing_info.delete_marker {
-        return Err(SwiftError::NotFound(format!("Object '{}' not found in container '{}'", object, container)));
+        return Err(SwiftError::NotFound(format!(
+            "Object '{}' not found in container '{}'",
+            object, container
+        )));
     }
 
     // 8. Extract new metadata from X-Object-Meta-* headers
     let mut new_metadata = HashMap::new();
     for (header_name, header_value) in headers.iter() {
         let header_str = header_name.as_str().to_lowercase();
-        if header_str.starts_with("x-object-meta-") {
-            let meta_key = &header_str[14..]; // Remove "x-object-meta-" prefix
-            if let Ok(value_str) = header_value.to_str() {
-                new_metadata.insert(meta_key.to_string(), value_str.to_string());
-            }
+        if let Some(meta_key) = header_str.strip_prefix("x-object-meta-")
+            && let Ok(value_str) = header_value.to_str()
+        {
+            new_metadata.insert(meta_key.to_string(), value_str.to_string());
         }
     }
 
     // 9. Also update Content-Type if provided
-    if let Some(content_type) = headers.get("content-type") {
-        if let Ok(ct_str) = content_type.to_str() {
-            new_metadata.insert("content-type".to_string(), ct_str.to_string());
-        }
+    if let Some(content_type) = headers.get("content-type")
+        && let Ok(ct_str) = content_type.to_str()
+    {
+        new_metadata.insert("content-type".to_string(), ct_str.to_string());
     }
 
     // 10. Prepare options for metadata update
     // Swift POST replaces all custom metadata, not merges
-    let mut update_opts = ObjectOptions::default();
-    update_opts.user_defined = new_metadata;
-    update_opts.mod_time = existing_info.mod_time; // Preserve modification time
-    update_opts.version_id = existing_info.version_id.map(|v| v.to_string()); // Preserve version
+    let update_opts = ObjectOptions {
+        user_defined: new_metadata,
+        mod_time: existing_info.mod_time,
+        version_id: existing_info.version_id.map(|v| v.to_string()),
+        ..Default::default()
+    };
 
     // 11. Update object metadata
     let _updated_info = store
         .put_object_metadata(&bucket, &s3_key, &update_opts)
         .await
-        .map_err(|e| {
-            SwiftError::InternalServerError(format!("Failed to update object metadata: {}", e))
-        })?;
+        .map_err(|e| SwiftError::InternalServerError(format!("Failed to update object metadata: {}", e)))?;
 
     Ok(())
 }
@@ -673,6 +635,7 @@ pub async fn update_object_metadata(
 /// The current handler architecture needs to be updated to pass headers through
 /// to support COPY method and X-Copy-From header detection. See handler.rs for details.
 #[allow(dead_code)] // Phase 3: Will be used in handler for COPY object operation
+#[allow(clippy::too_many_arguments)] // Necessary for full copy functionality
 pub async fn copy_object(
     src_account: &str,
     src_container: &str,
@@ -704,9 +667,7 @@ pub async fn copy_object(
 
     // 6. Get storage layer
     let Some(store) = new_object_layer_fn() else {
-        return Err(SwiftError::InternalServerError(
-            "Storage layer not initialized".to_string()
-        ));
+        return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
     // 7. First, verify source object exists and get its info
@@ -725,22 +686,22 @@ pub async fn copy_object(
 
     // 8. Check if source is a delete marker
     if src_info.delete_marker {
-        return Err(SwiftError::NotFound(format!("Source object '{}' not found in container '{}'", src_object, src_container)));
+        return Err(SwiftError::NotFound(format!(
+            "Source object '{}' not found in container '{}'",
+            src_object, src_container
+        )));
     }
 
     // 9. Verify destination container exists by trying to get its info
     let bucket_opts = BucketOptions::default();
-    let _dst_bucket_info = store
-        .get_bucket_info(&dst_bucket, &bucket_opts)
-        .await
-        .map_err(|e| {
-            let err_str = e.to_string();
-            if err_str.contains("does not exist") || err_str.contains("not found") {
-                SwiftError::NotFound(format!("Destination container '{}' not found", dst_container))
-            } else {
-                SwiftError::InternalServerError(format!("Failed to check destination container: {}", e))
-            }
-        })?;
+    let _dst_bucket_info = store.get_bucket_info(&dst_bucket, &bucket_opts).await.map_err(|e| {
+        let err_str = e.to_string();
+        if err_str.contains("does not exist") || err_str.contains("not found") {
+            SwiftError::NotFound(format!("Destination container '{}' not found", dst_container))
+        } else {
+            SwiftError::InternalServerError(format!("Failed to check destination container: {}", e))
+        }
+    })?;
 
     // 10. Prepare metadata for destination object
     // Start with source metadata
@@ -750,13 +711,12 @@ pub async fn copy_object(
     let mut has_custom_meta = false;
     for (header_name, header_value) in headers.iter() {
         let header_str = header_name.as_str().to_lowercase();
-        if header_str.starts_with("x-object-meta-") {
+        if let Some(meta_key) = header_str.strip_prefix("x-object-meta-") {
             if !has_custom_meta {
                 // First custom meta header - clear source metadata
                 new_metadata.clear();
                 has_custom_meta = true;
             }
-            let meta_key = &header_str[14..]; // Remove "x-object-meta-" prefix
             if let Ok(value_str) = header_value.to_str() {
                 new_metadata.insert(meta_key.to_string(), value_str.to_string());
             }
@@ -775,16 +735,16 @@ pub async fn copy_object(
     }
 
     // 13. Prepare destination options
-    let mut dst_opts = ObjectOptions::default();
-    dst_opts.user_defined = new_metadata;
+    let dst_opts = ObjectOptions {
+        user_defined: new_metadata,
+        ..Default::default()
+    };
 
     // 14. Perform server-side copy
     let dst_info = store
         .copy_object(&src_bucket, &src_s3_key, &dst_bucket, &dst_s3_key, &mut src_info, &src_opts, &dst_opts)
         .await
-        .map_err(|e| {
-            SwiftError::InternalServerError(format!("Failed to copy object: {}", e))
-        })?;
+        .map_err(|e| SwiftError::InternalServerError(format!("Failed to copy object: {}", e)))?;
 
     // 15. Return the ETag of the destination object
     Ok(dst_info.etag.unwrap_or_default())
@@ -815,7 +775,7 @@ pub fn parse_destination_header(destination: &str) -> SwiftResult<(String, Strin
 
     if parts.len() < 2 {
         return Err(SwiftError::BadRequest(
-            "Invalid Destination header format. Expected: /container/object".to_string()
+            "Invalid Destination header format. Expected: /container/object".to_string(),
         ));
     }
 
@@ -824,7 +784,7 @@ pub fn parse_destination_header(destination: &str) -> SwiftResult<(String, Strin
 
     if container.is_empty() || object.is_empty() {
         return Err(SwiftError::BadRequest(
-            "Destination container and object names cannot be empty".to_string()
+            "Destination container and object names cannot be empty".to_string(),
         ));
     }
 
@@ -876,9 +836,7 @@ pub fn parse_range_header(range_str: &str) -> SwiftResult<rustfs_ecstore::store_
     use rustfs_ecstore::store_api::HTTPRangeSpec;
 
     if !range_str.starts_with("bytes=") {
-        return Err(SwiftError::BadRequest(
-            "Range header must start with 'bytes='".to_string()
-        ));
+        return Err(SwiftError::BadRequest("Range header must start with 'bytes='".to_string()));
     }
 
     let range_part = &range_str[6..]; // Remove "bytes=" prefix
@@ -888,9 +846,7 @@ pub fn parse_range_header(range_str: &str) -> SwiftResult<rustfs_ecstore::store_
         let end_str = &range_part[dash_pos + 1..];
 
         if start_str.is_empty() && end_str.is_empty() {
-            return Err(SwiftError::BadRequest(
-                "Invalid range format: both start and end are empty".to_string()
-            ));
+            return Err(SwiftError::BadRequest("Invalid range format: both start and end are empty".to_string()));
         }
 
         if start_str.is_empty() {
@@ -900,9 +856,7 @@ pub fn parse_range_header(range_str: &str) -> SwiftResult<rustfs_ecstore::store_
                 .map_err(|_| SwiftError::BadRequest("Invalid range format: suffix length not a number".to_string()))?;
 
             if length <= 0 {
-                return Err(SwiftError::BadRequest(
-                    "Invalid range format: suffix length must be positive".to_string()
-                ));
+                return Err(SwiftError::BadRequest("Invalid range format: suffix length must be positive".to_string()));
             }
 
             Ok(HTTPRangeSpec {
@@ -925,15 +879,11 @@ pub fn parse_range_header(range_str: &str) -> SwiftResult<rustfs_ecstore::store_
             };
 
             if start < 0 {
-                return Err(SwiftError::BadRequest(
-                    "Invalid range format: start must be non-negative".to_string()
-                ));
+                return Err(SwiftError::BadRequest("Invalid range format: start must be non-negative".to_string()));
             }
 
             if end != -1 && end < start {
-                return Err(SwiftError::BadRequest(
-                    "Invalid range format: end must be >= start".to_string()
-                ));
+                return Err(SwiftError::BadRequest("Invalid range format: end must be >= start".to_string()));
             }
 
             Ok(HTTPRangeSpec {
@@ -943,9 +893,7 @@ pub fn parse_range_header(range_str: &str) -> SwiftResult<rustfs_ecstore::store_
             })
         }
     } else {
-        Err(SwiftError::BadRequest(
-            "Invalid range format: missing '-'".to_string()
-        ))
+        Err(SwiftError::BadRequest("Invalid range format: missing '-'".to_string()))
     }
 }
 
@@ -1036,39 +984,21 @@ mod tests {
 
     #[test]
     fn test_swift_to_s3_key() {
-        assert_eq!(
-            ObjectKeyMapper::swift_to_s3_key("file.txt").unwrap(),
-            "file.txt"
-        );
-        assert_eq!(
-            ObjectKeyMapper::swift_to_s3_key("path/to/file.jpg").unwrap(),
-            "path/to/file.jpg"
-        );
-        assert_eq!(
-            ObjectKeyMapper::swift_to_s3_key("file with spaces.pdf").unwrap(),
-            "file with spaces.pdf"
-        );
+        assert_eq!(ObjectKeyMapper::swift_to_s3_key("file.txt").unwrap(), "file.txt");
+        assert_eq!(ObjectKeyMapper::swift_to_s3_key("path/to/file.jpg").unwrap(), "path/to/file.jpg");
+        assert_eq!(ObjectKeyMapper::swift_to_s3_key("file with spaces.pdf").unwrap(), "file with spaces.pdf");
     }
 
     #[test]
     fn test_s3_to_swift_name() {
-        assert_eq!(
-            ObjectKeyMapper::s3_to_swift_name("file.txt"),
-            "file.txt"
-        );
-        assert_eq!(
-            ObjectKeyMapper::s3_to_swift_name("path/to/file.jpg"),
-            "path/to/file.jpg"
-        );
+        assert_eq!(ObjectKeyMapper::s3_to_swift_name("file.txt"), "file.txt");
+        assert_eq!(ObjectKeyMapper::s3_to_swift_name("path/to/file.jpg"), "path/to/file.jpg");
     }
 
     #[test]
     fn test_decode_object_from_url() {
         // Basic decoding
-        assert_eq!(
-            ObjectKeyMapper::decode_object_from_url("file.txt").unwrap(),
-            "file.txt"
-        );
+        assert_eq!(ObjectKeyMapper::decode_object_from_url("file.txt").unwrap(), "file.txt");
 
         // Percent-encoded spaces
         assert_eq!(
@@ -1083,28 +1013,16 @@ mod tests {
         );
 
         // Unicode characters
-        assert_eq!(
-            ObjectKeyMapper::decode_object_from_url("%E6%96%87%E4%BB%B6.txt").unwrap(),
-            "文件.txt"
-        );
+        assert_eq!(ObjectKeyMapper::decode_object_from_url("%E6%96%87%E4%BB%B6.txt").unwrap(), "文件.txt");
     }
 
     #[test]
     fn test_encode_object_for_url() {
-        assert_eq!(
-            ObjectKeyMapper::encode_object_for_url("file.txt"),
-            "file.txt"
-        );
+        assert_eq!(ObjectKeyMapper::encode_object_for_url("file.txt"), "file.txt");
 
-        assert_eq!(
-            ObjectKeyMapper::encode_object_for_url("file with spaces.txt"),
-            "file%20with%20spaces.txt"
-        );
+        assert_eq!(ObjectKeyMapper::encode_object_for_url("file with spaces.txt"), "file%20with%20spaces.txt");
 
-        assert_eq!(
-            ObjectKeyMapper::encode_object_for_url("path/to/file.txt"),
-            "path%2Fto%2Ffile.txt"
-        );
+        assert_eq!(ObjectKeyMapper::encode_object_for_url("path/to/file.txt"), "path%2Fto%2Ffile.txt");
     }
 
     #[test]
@@ -1118,28 +1036,16 @@ mod tests {
     #[test]
     fn test_normalize_path() {
         // Remove redundant slashes
-        assert_eq!(
-            ObjectKeyMapper::normalize_path("path//to///file.txt"),
-            "path/to/file.txt"
-        );
+        assert_eq!(ObjectKeyMapper::normalize_path("path//to///file.txt"), "path/to/file.txt");
 
         // Preserve trailing slash for directories
-        assert_eq!(
-            ObjectKeyMapper::normalize_path("path/to/dir/"),
-            "path/to/dir/"
-        );
+        assert_eq!(ObjectKeyMapper::normalize_path("path/to/dir/"), "path/to/dir/");
 
         // Remove leading/trailing slashes except for directory marker
-        assert_eq!(
-            ObjectKeyMapper::normalize_path("/path/to/file.txt"),
-            "path/to/file.txt"
-        );
+        assert_eq!(ObjectKeyMapper::normalize_path("/path/to/file.txt"), "path/to/file.txt");
 
         // Empty segments
-        assert_eq!(
-            ObjectKeyMapper::normalize_path("path///to/file.txt"),
-            "path/to/file.txt"
-        );
+        assert_eq!(ObjectKeyMapper::normalize_path("path///to/file.txt"), "path/to/file.txt");
     }
 
     #[test]
@@ -1185,13 +1091,13 @@ mod tests {
     fn test_parse_range_header_regular() {
         // Regular range: bytes=0-1023
         let range = parse_range_header("bytes=0-1023").unwrap();
-        assert_eq!(range.is_suffix_length, false);
+        assert!(!range.is_suffix_length);
         assert_eq!(range.start, 0);
         assert_eq!(range.end, 1023);
 
         // Another regular range
         let range = parse_range_header("bytes=1000-1999").unwrap();
-        assert_eq!(range.is_suffix_length, false);
+        assert!(!range.is_suffix_length);
         assert_eq!(range.start, 1000);
         assert_eq!(range.end, 1999);
     }
@@ -1200,13 +1106,13 @@ mod tests {
     fn test_parse_range_header_open_ended() {
         // Open-ended range: bytes=1000-
         let range = parse_range_header("bytes=1000-").unwrap();
-        assert_eq!(range.is_suffix_length, false);
+        assert!(!range.is_suffix_length);
         assert_eq!(range.start, 1000);
         assert_eq!(range.end, -1);
 
         // From start to end
         let range = parse_range_header("bytes=0-").unwrap();
-        assert_eq!(range.is_suffix_length, false);
+        assert!(!range.is_suffix_length);
         assert_eq!(range.start, 0);
         assert_eq!(range.end, -1);
     }
@@ -1215,13 +1121,13 @@ mod tests {
     fn test_parse_range_header_suffix() {
         // Suffix range: bytes=-500 (last 500 bytes)
         let range = parse_range_header("bytes=-500").unwrap();
-        assert_eq!(range.is_suffix_length, true);
+        assert!(range.is_suffix_length);
         assert_eq!(range.start, -500);
         assert_eq!(range.end, -1);
 
         // Last 1 byte
         let range = parse_range_header("bytes=-1").unwrap();
-        assert_eq!(range.is_suffix_length, true);
+        assert!(range.is_suffix_length);
         assert_eq!(range.start, -1);
         assert_eq!(range.end, -1);
     }
@@ -1262,14 +1168,8 @@ mod tests {
 
     #[test]
     fn test_build_s3_key() {
-        assert_eq!(
-            ObjectKeyMapper::build_s3_key("file.txt").unwrap(),
-            "file.txt"
-        );
+        assert_eq!(ObjectKeyMapper::build_s3_key("file.txt").unwrap(), "file.txt");
 
-        assert_eq!(
-            ObjectKeyMapper::build_s3_key("path/to/file.jpg").unwrap(),
-            "path/to/file.jpg"
-        );
+        assert_eq!(ObjectKeyMapper::build_s3_key("path/to/file.jpg").unwrap(), "path/to/file.jpg");
     }
 }

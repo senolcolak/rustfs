@@ -48,8 +48,7 @@ impl SwiftTestSettings {
             // For testing, we use a mock token or configure Keystone in test environment
             auth_token: env::var("TEST_SWIFT_TOKEN").unwrap_or_else(|_| "test-token".to_string()),
             // Test with a mock project ID
-            account: env::var("TEST_SWIFT_ACCOUNT")
-                .unwrap_or_else(|_| "AUTH_test-project-123".to_string()),
+            account: env::var("TEST_SWIFT_ACCOUNT").unwrap_or_else(|_| "AUTH_test-project-123".to_string()),
         }
     }
 
@@ -86,7 +85,7 @@ impl SwiftClient {
     /// List containers (GET /v1/{account})
     async fn list_containers(&self) -> Result<Response> {
         self.client
-            .get(&self.settings.account_url())
+            .get(self.settings.account_url())
             .header("X-Auth-Token", &self.settings.auth_token)
             .send()
             .await
@@ -96,7 +95,7 @@ impl SwiftClient {
     /// Create container (PUT /v1/{account}/{container})
     async fn create_container(&self, container: &str) -> Result<Response> {
         self.client
-            .put(&self.settings.container_url(container))
+            .put(self.settings.container_url(container))
             .header("X-Auth-Token", &self.settings.auth_token)
             .send()
             .await
@@ -106,7 +105,7 @@ impl SwiftClient {
     /// Get container metadata (HEAD /v1/{account}/{container})
     async fn head_container(&self, container: &str) -> Result<Response> {
         self.client
-            .head(&self.settings.container_url(container))
+            .head(self.settings.container_url(container))
             .header("X-Auth-Token", &self.settings.auth_token)
             .send()
             .await
@@ -114,14 +113,10 @@ impl SwiftClient {
     }
 
     /// Update container metadata (POST /v1/{account}/{container})
-    async fn update_container_metadata(
-        &self,
-        container: &str,
-        metadata: HashMap<String, String>,
-    ) -> Result<Response> {
+    async fn update_container_metadata(&self, container: &str, metadata: HashMap<String, String>) -> Result<Response> {
         let mut req = self
             .client
-            .post(&self.settings.container_url(container))
+            .post(self.settings.container_url(container))
             .header("X-Auth-Token", &self.settings.auth_token);
 
         // Add X-Container-Meta-* headers
@@ -135,7 +130,7 @@ impl SwiftClient {
     /// Delete container (DELETE /v1/{account}/{container})
     async fn delete_container(&self, container: &str) -> Result<Response> {
         self.client
-            .delete(&self.settings.container_url(container))
+            .delete(self.settings.container_url(container))
             .header("X-Auth-Token", &self.settings.auth_token)
             .send()
             .await
@@ -159,17 +154,10 @@ async fn test_create_container() -> Result<()> {
     let response = client.create_container(&container_name).await?;
 
     // Should return 201 Created for new container
-    assert_eq!(
-        response.status(),
-        StatusCode::CREATED,
-        "Expected 201 Created for new container"
-    );
+    assert_eq!(response.status(), StatusCode::CREATED, "Expected 201 Created for new container");
 
     // Verify Swift transaction headers
-    assert!(
-        response.headers().contains_key("x-trans-id"),
-        "Missing X-Trans-Id header"
-    );
+    assert!(response.headers().contains_key("x-trans-id"), "Missing X-Trans-Id header");
     assert!(
         response.headers().contains_key("x-openstack-request-id"),
         "Missing X-OpenStack-Request-Id header"
@@ -199,11 +187,7 @@ async fn test_create_container_idempotent() -> Result<()> {
 
     // Second creation (idempotent)
     let response2 = client.create_container(&container_name).await?;
-    assert_eq!(
-        response2.status(),
-        StatusCode::ACCEPTED,
-        "Expected 202 Accepted for existing container"
-    );
+    assert_eq!(response2.status(), StatusCode::ACCEPTED, "Expected 202 Accepted for existing container");
 
     // Cleanup
     let _ = client.delete_container(&container_name).await;
@@ -232,10 +216,7 @@ async fn test_list_containers() -> Result<()> {
     assert_eq!(response.status(), StatusCode::OK);
 
     // Parse JSON response
-    let containers: Vec<Value> = response
-        .json()
-        .await
-        .context("Failed to parse container list JSON")?;
+    let containers: Vec<Value> = response.json().await.context("Failed to parse container list JSON")?;
 
     // Verify container is in the list
     let found = containers.iter().any(|c| {
@@ -280,14 +261,8 @@ async fn test_container_metadata() -> Result<()> {
         headers.contains_key("x-container-object-count"),
         "Missing X-Container-Object-Count header"
     );
-    assert!(
-        headers.contains_key("x-container-bytes-used"),
-        "Missing X-Container-Bytes-Used header"
-    );
-    assert!(
-        headers.contains_key("x-trans-id"),
-        "Missing X-Trans-Id header"
-    );
+    assert!(headers.contains_key("x-container-bytes-used"), "Missing X-Container-Bytes-Used header");
+    assert!(headers.contains_key("x-trans-id"), "Missing X-Trans-Id header");
 
     // Cleanup
     let _ = client.delete_container(&container_name).await;
@@ -314,9 +289,7 @@ async fn test_update_container_metadata() -> Result<()> {
     let mut metadata = HashMap::new();
     metadata.insert("test-key".to_string(), "test-value".to_string());
 
-    let response = client
-        .update_container_metadata(&container_name, metadata)
-        .await?;
+    let response = client.update_container_metadata(&container_name, metadata).await?;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
     // Cleanup
@@ -346,11 +319,7 @@ async fn test_delete_container() -> Result<()> {
 
     // Verify container is deleted (HEAD should return 404)
     let head_response = client.head_container(&container_name).await?;
-    assert_eq!(
-        head_response.status(),
-        StatusCode::NOT_FOUND,
-        "Container should be deleted"
-    );
+    assert_eq!(head_response.status(), StatusCode::NOT_FOUND, "Container should be deleted");
 
     Ok(())
 }
@@ -391,25 +360,16 @@ async fn test_container_name_validation() -> Result<()> {
 
     // Test empty name (this would be caught by URL construction, but let's test with slash)
     let response = client.create_container("").await?;
-    assert!(
-        response.status().is_client_error(),
-        "Empty container name should be rejected"
-    );
+    assert!(response.status().is_client_error(), "Empty container name should be rejected");
 
     // Test name with slash
     let response = client.create_container("test/container").await?;
-    assert!(
-        response.status().is_client_error(),
-        "Container name with '/' should be rejected"
-    );
+    assert!(response.status().is_client_error(), "Container name with '/' should be rejected");
 
     // Test name too long (> 256 chars)
     let long_name = "a".repeat(257);
     let response = client.create_container(&long_name).await?;
-    assert!(
-        response.status().is_client_error(),
-        "Container name > 256 chars should be rejected"
-    );
+    assert!(response.status().is_client_error(), "Container name > 256 chars should be rejected");
 
     Ok(())
 }
@@ -450,9 +410,7 @@ async fn test_container_lifecycle() -> Result<()> {
     // 4. Update metadata
     let mut metadata = HashMap::new();
     metadata.insert("lifecycle-test".to_string(), "true".to_string());
-    let update_response = client
-        .update_container_metadata(&container_name, metadata)
-        .await?;
+    let update_response = client.update_container_metadata(&container_name, metadata).await?;
     assert_eq!(update_response.status(), StatusCode::NO_CONTENT);
 
     // 5. Delete container

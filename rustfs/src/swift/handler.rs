@@ -18,8 +18,8 @@
 //! requests and delegates to appropriate Swift handlers or falls through
 //! to S3 service for non-Swift requests.
 
-use crate::swift::{SwiftRoute, SwiftRouter, SwiftError};
 use crate::swift::container;
+use crate::swift::{SwiftError, SwiftRoute, SwiftRouter};
 use axum::http::{Method, Request, Response, StatusCode};
 use futures::Future;
 use rustfs_credentials::Credentials;
@@ -95,15 +95,9 @@ where
 }
 
 /// Handle Swift API requests
-async fn handle_swift_request(
-    route: SwiftRoute,
-    credentials: Option<Credentials>,
-) -> Result<Response<Body>, SwiftError> {
-
+async fn handle_swift_request(route: SwiftRoute, credentials: Option<Credentials>) -> Result<Response<Body>, SwiftError> {
     // Credentials are required for all Swift operations
-    let credentials = credentials.ok_or_else(|| {
-        SwiftError::Unauthorized("Authentication required".to_string())
-    })?;
+    let credentials = credentials.ok_or_else(|| SwiftError::Unauthorized("Authentication required".to_string()))?;
 
     match route {
         SwiftRoute::Account { account, method } => {
@@ -127,19 +121,19 @@ async fn handle_swift_request(
                 }
                 Method::HEAD => {
                     // Account metadata - Phase 2
-                    Err(SwiftError::InternalServerError(
-                        format!("Swift Account HEAD operation not yet implemented: HEAD {}", account)
-                    ))
+                    Err(SwiftError::InternalServerError(format!(
+                        "Swift Account HEAD operation not yet implemented: HEAD {}",
+                        account
+                    )))
                 }
                 Method::POST => {
                     // Update account metadata - Phase 2
-                    Err(SwiftError::InternalServerError(
-                        format!("Swift Account POST operation not yet implemented: POST {}", account)
-                    ))
+                    Err(SwiftError::InternalServerError(format!(
+                        "Swift Account POST operation not yet implemented: POST {}",
+                        account
+                    )))
                 }
-                _ => {
-                    Err(SwiftError::BadRequest(format!("Unsupported method for account: {}", method)))
-                }
+                _ => Err(SwiftError::BadRequest(format!("Unsupported method for account: {}", method))),
             }
         }
         SwiftRoute::Container {
@@ -170,9 +164,10 @@ async fn handle_swift_request(
                 }
                 Method::GET => {
                     // List objects in container - Phase 3
-                    Err(SwiftError::InternalServerError(
-                        format!("Swift Container GET operation not yet implemented: GET {}/{}", account, container)
-                    ))
+                    Err(SwiftError::InternalServerError(format!(
+                        "Swift Container GET operation not yet implemented: GET {}/{}",
+                        account, container
+                    )))
                 }
                 Method::HEAD => {
                     // Container metadata
@@ -190,7 +185,8 @@ async fn handle_swift_request(
 
                     // Add creation timestamp if available
                     if let Some(created) = metadata.created
-                        && let Ok(timestamp_str) = created.format(&time::format_description::well_known::Rfc3339) {
+                        && let Ok(timestamp_str) = created.format(&time::format_description::well_known::Rfc3339)
+                    {
                         response = response.header("x-timestamp", timestamp_str);
                     }
 
@@ -233,9 +229,7 @@ async fn handle_swift_request(
                         .body(Body::empty())
                         .unwrap())
                 }
-                _ => {
-                    Err(SwiftError::BadRequest(format!("Unsupported method for container: {}", method)))
-                }
+                _ => Err(SwiftError::BadRequest(format!("Unsupported method for container: {}", method))),
             }
         }
         SwiftRoute::Object {
@@ -245,12 +239,10 @@ async fn handle_swift_request(
             method,
         } => {
             // Phase 3: Object operations
-            Err(SwiftError::InternalServerError(
-                format!(
-                    "Swift Object operation not yet implemented: {} {}/{}/{}",
-                    method, account, container, object
-                )
-            ))
+            Err(SwiftError::InternalServerError(format!(
+                "Swift Object operation not yet implemented: {} {}/{}/{}",
+                method, account, container, object
+            )))
         }
     }
 }

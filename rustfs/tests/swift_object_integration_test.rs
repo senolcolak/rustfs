@@ -45,12 +45,9 @@ struct SwiftTestSettings {
 impl SwiftTestSettings {
     fn new() -> Self {
         Self {
-            endpoint: env::var("TEST_RUSTFS_SERVER")
-                .unwrap_or_else(|_| "http://localhost:9000".to_string()),
-            auth_token: env::var("TEST_SWIFT_TOKEN")
-                .unwrap_or_else(|_| "test-token".to_string()),
-            account: env::var("TEST_SWIFT_ACCOUNT")
-                .unwrap_or_else(|_| "AUTH_test-project-123".to_string()),
+            endpoint: env::var("TEST_RUSTFS_SERVER").unwrap_or_else(|_| "http://localhost:9000".to_string()),
+            auth_token: env::var("TEST_SWIFT_TOKEN").unwrap_or_else(|_| "test-token".to_string()),
+            account: env::var("TEST_SWIFT_ACCOUNT").unwrap_or_else(|_| "AUTH_test-project-123".to_string()),
         }
     }
 
@@ -61,10 +58,7 @@ impl SwiftTestSettings {
 
     /// Build Swift URL for object operations
     fn object_url(&self, container: &str, object: &str) -> String {
-        format!(
-            "{}/v1/{}/{}/{}",
-            self.endpoint, self.account, container, object
-        )
+        format!("{}/v1/{}/{}/{}", self.endpoint, self.account, container, object)
     }
 }
 
@@ -90,7 +84,7 @@ impl SwiftClient {
     /// Create container (PUT /v1/{account}/{container})
     async fn create_container(&self, container: &str) -> Result<Response> {
         self.client
-            .put(&self.settings.container_url(container))
+            .put(self.settings.container_url(container))
             .header("X-Auth-Token", &self.settings.auth_token)
             .send()
             .await
@@ -100,7 +94,7 @@ impl SwiftClient {
     /// Delete container (DELETE /v1/{account}/{container})
     async fn delete_container(&self, container: &str) -> Result<Response> {
         self.client
-            .delete(&self.settings.container_url(container))
+            .delete(self.settings.container_url(container))
             .header("X-Auth-Token", &self.settings.auth_token)
             .send()
             .await
@@ -117,7 +111,7 @@ impl SwiftClient {
     ) -> Result<Response> {
         let mut req = self
             .client
-            .put(&self.settings.object_url(container, object))
+            .put(self.settings.object_url(container, object))
             .header("X-Auth-Token", &self.settings.auth_token)
             .body(content);
 
@@ -134,7 +128,7 @@ impl SwiftClient {
     /// Download object (GET /v1/{account}/{container}/{object})
     async fn get_object(&self, container: &str, object: &str) -> Result<Response> {
         self.client
-            .get(&self.settings.object_url(container, object))
+            .get(self.settings.object_url(container, object))
             .header("X-Auth-Token", &self.settings.auth_token)
             .send()
             .await
@@ -144,7 +138,7 @@ impl SwiftClient {
     /// Get object metadata (HEAD /v1/{account}/{container}/{object})
     async fn head_object(&self, container: &str, object: &str) -> Result<Response> {
         self.client
-            .head(&self.settings.object_url(container, object))
+            .head(self.settings.object_url(container, object))
             .header("X-Auth-Token", &self.settings.auth_token)
             .send()
             .await
@@ -152,15 +146,10 @@ impl SwiftClient {
     }
 
     /// Update object metadata (POST /v1/{account}/{container}/{object})
-    async fn update_object_metadata(
-        &self,
-        container: &str,
-        object: &str,
-        metadata: HashMap<String, String>,
-    ) -> Result<Response> {
+    async fn update_object_metadata(&self, container: &str, object: &str, metadata: HashMap<String, String>) -> Result<Response> {
         let mut req = self
             .client
-            .post(&self.settings.object_url(container, object))
+            .post(self.settings.object_url(container, object))
             .header("X-Auth-Token", &self.settings.auth_token);
 
         // Add X-Object-Meta-* headers
@@ -168,15 +157,13 @@ impl SwiftClient {
             req = req.header(format!("X-Object-Meta-{}", key), value);
         }
 
-        req.send()
-            .await
-            .context("Failed to update object metadata")
+        req.send().await.context("Failed to update object metadata")
     }
 
     /// Delete object (DELETE /v1/{account}/{container}/{object})
     async fn delete_object(&self, container: &str, object: &str) -> Result<Response> {
         self.client
-            .delete(&self.settings.object_url(container, object))
+            .delete(self.settings.object_url(container, object))
             .header("X-Auth-Token", &self.settings.auth_token)
             .send()
             .await
@@ -186,7 +173,7 @@ impl SwiftClient {
     /// List objects in container (GET /v1/{account}/{container})
     async fn list_objects(&self, container: &str) -> Result<Response> {
         self.client
-            .get(&self.settings.container_url(container))
+            .get(self.settings.container_url(container))
             .header("X-Auth-Token", &self.settings.auth_token)
             .send()
             .await
@@ -216,23 +203,13 @@ async fn test_upload_object() -> Result<()> {
     let response = client.put_object(&container_name, object_name, content, None).await?;
 
     // Should return 201 Created
-    assert_eq!(
-        response.status(),
-        StatusCode::CREATED,
-        "Expected 201 Created for new object"
-    );
+    assert_eq!(response.status(), StatusCode::CREATED, "Expected 201 Created for new object");
 
     // Verify ETag header
-    assert!(
-        response.headers().contains_key("etag"),
-        "Missing ETag header"
-    );
+    assert!(response.headers().contains_key("etag"), "Missing ETag header");
 
     // Verify Swift transaction headers
-    assert!(
-        response.headers().contains_key("x-trans-id"),
-        "Missing X-Trans-Id header"
-    );
+    assert!(response.headers().contains_key("x-trans-id"), "Missing X-Trans-Id header");
 
     // Cleanup
     let _ = client.delete_object(&container_name, object_name).await;
@@ -274,14 +251,8 @@ async fn test_upload_object_with_metadata() -> Result<()> {
     assert_eq!(head_response.status(), StatusCode::OK);
 
     let headers = head_response.headers();
-    assert!(
-        headers.contains_key("x-object-meta-author"),
-        "Missing X-Object-Meta-Author header"
-    );
-    assert!(
-        headers.contains_key("x-object-meta-version"),
-        "Missing X-Object-Meta-Version header"
-    );
+    assert!(headers.contains_key("x-object-meta-author"), "Missing X-Object-Meta-Author header");
+    assert!(headers.contains_key("x-object-meta-version"), "Missing X-Object-Meta-Version header");
 
     // Cleanup
     let _ = client.delete_object(&container_name, object_name).await;
@@ -307,9 +278,7 @@ async fn test_download_object() -> Result<()> {
     // Create container and upload object
     let _ = client.create_container(&container_name).await?;
     let content = b"Test download content".to_vec();
-    let _ = client
-        .put_object(&container_name, object_name, content.clone(), None)
-        .await?;
+    let _ = client.put_object(&container_name, object_name, content.clone(), None).await?;
 
     // Download object
     let response = client.get_object(&container_name, object_name).await?;
@@ -345,9 +314,7 @@ async fn test_head_object() -> Result<()> {
     // Create container and upload object
     let _ = client.create_container(&container_name).await?;
     let content = b"Test head content".to_vec();
-    let _ = client
-        .put_object(&container_name, object_name, content.clone(), None)
-        .await?;
+    let _ = client.put_object(&container_name, object_name, content.clone(), None).await?;
 
     // Get metadata
     let response = client.head_object(&container_name, object_name).await?;
@@ -356,15 +323,9 @@ async fn test_head_object() -> Result<()> {
 
     // Verify headers
     let headers = response.headers();
-    assert!(
-        headers.contains_key("content-length"),
-        "Missing Content-Length header"
-    );
+    assert!(headers.contains_key("content-length"), "Missing Content-Length header");
     assert!(headers.contains_key("etag"), "Missing ETag header");
-    assert!(
-        headers.contains_key("last-modified"),
-        "Missing Last-Modified header"
-    );
+    assert!(headers.contains_key("last-modified"), "Missing Last-Modified header");
 
     // Cleanup
     let _ = client.delete_object(&container_name, object_name).await;
@@ -390,9 +351,7 @@ async fn test_update_object_metadata() -> Result<()> {
     // Create container and upload object
     let _ = client.create_container(&container_name).await?;
     let content = b"Test metadata update".to_vec();
-    let _ = client
-        .put_object(&container_name, object_name, content.clone(), None)
-        .await?;
+    let _ = client.put_object(&container_name, object_name, content.clone(), None).await?;
 
     // Update metadata
     let mut new_metadata = HashMap::new();
@@ -407,21 +366,13 @@ async fn test_update_object_metadata() -> Result<()> {
 
     // Verify metadata was updated
     let head_response = client.head_object(&container_name, object_name).await?;
-    assert!(head_response
-        .headers()
-        .contains_key("x-object-meta-updated"));
-    assert!(head_response
-        .headers()
-        .contains_key("x-object-meta-timestamp"));
+    assert!(head_response.headers().contains_key("x-object-meta-updated"));
+    assert!(head_response.headers().contains_key("x-object-meta-timestamp"));
 
     // Verify content was not modified
     let get_response = client.get_object(&container_name, object_name).await?;
     let downloaded = get_response.bytes().await?;
-    assert_eq!(
-        downloaded.to_vec(),
-        content,
-        "Content should not be modified"
-    );
+    assert_eq!(downloaded.to_vec(), content, "Content should not be modified");
 
     // Cleanup
     let _ = client.delete_object(&container_name, object_name).await;
@@ -446,9 +397,7 @@ async fn test_delete_object() -> Result<()> {
     // Create container and upload object
     let _ = client.create_container(&container_name).await?;
     let content = b"Test delete".to_vec();
-    let _ = client
-        .put_object(&container_name, object_name, content, None)
-        .await?;
+    let _ = client.put_object(&container_name, object_name, content, None).await?;
 
     // Delete object
     let response = client.delete_object(&container_name, object_name).await?;
@@ -457,11 +406,7 @@ async fn test_delete_object() -> Result<()> {
 
     // Verify object is deleted (GET should return 404)
     let get_response = client.get_object(&container_name, object_name).await?;
-    assert_eq!(
-        get_response.status(),
-        StatusCode::NOT_FOUND,
-        "Object should be deleted"
-    );
+    assert_eq!(get_response.status(), StatusCode::NOT_FOUND, "Object should be deleted");
 
     // Cleanup
     let _ = client.delete_container(&container_name).await;
@@ -520,9 +465,7 @@ async fn test_list_objects() -> Result<()> {
     let objects = vec!["obj1.txt", "obj2.txt", "obj3.txt"];
     for obj_name in &objects {
         let content = format!("Content of {}", obj_name).into_bytes();
-        let _ = client
-            .put_object(&container_name, obj_name, content, None)
-            .await?;
+        let _ = client.put_object(&container_name, obj_name, content, None).await?;
     }
 
     // List objects
@@ -530,10 +473,7 @@ async fn test_list_objects() -> Result<()> {
     assert_eq!(response.status(), StatusCode::OK);
 
     // Parse JSON response
-    let object_list: Vec<Value> = response
-        .json()
-        .await
-        .context("Failed to parse object list JSON")?;
+    let object_list: Vec<Value> = response.json().await.context("Failed to parse object list JSON")?;
 
     // Verify all objects are in the list
     assert!(
@@ -601,9 +541,7 @@ async fn test_object_lifecycle() -> Result<()> {
     // 3. Get metadata
     let head_response = client.head_object(&container_name, object_name).await?;
     assert_eq!(head_response.status(), StatusCode::OK);
-    assert!(head_response
-        .headers()
-        .contains_key("x-object-meta-test-type"));
+    assert!(head_response.headers().contains_key("x-object-meta-test-type"));
 
     // 4. Update metadata
     let mut new_metadata = HashMap::new();
