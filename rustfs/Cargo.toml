@@ -117,7 +117,9 @@ matchit = { workspace = true }
 md5.workspace = true
 mime_guess = { workspace = true }
 moka = { workspace = true }
+once_cell = { workspace = true }
 pin-project-lite.workspace = true
+regex = { workspace = true }
 rust-embed = { workspace = true, features = ["interpolate-folder-path"] }
 s3s.workspace = true
 shadow-rs = { workspace = true, features = ["build", "metadata"] }
