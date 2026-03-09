@@ -13,14 +13,7 @@
 // limitations under the License.
 
 use super::ecfs::FS;
-use super::ecfs::{
-    ACL_GROUP_ALL_USERS, ACL_GROUP_AUTHENTICATED_USERS, INTERNAL_ACL_METADATA_KEY, StoredAcl, default_owner,
-    parse_acl_json_or_canned_bucket, parse_acl_json_or_canned_object, stored_acl_from_canned_bucket,
-    stored_acl_from_canned_object,
-};
-use super::options::get_opts;
 use crate::auth::{check_key_valid, get_condition_values_with_query, get_session_token};
-use crate::error::ApiError;
 use crate::license::license_check;
 use crate::server::RemoteAddr;
 use metrics::counter;
@@ -28,7 +21,7 @@ use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_ecstore::bucket::policy_sys::PolicySys;
 use rustfs_ecstore::error::{StorageError, is_err_bucket_not_found};
 use rustfs_ecstore::new_object_layer_fn;
-use rustfs_ecstore::store_api::{BucketOperations, ObjectOperations};
+use rustfs_ecstore::store_api::BucketOperations;
 use rustfs_iam::error::Error as IamError;
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_policy::policy::{Args, BucketPolicyArgs};
@@ -46,165 +39,6 @@ pub(crate) struct ReqInfo {
     pub version_id: Option<String>,
     #[allow(dead_code)]
     pub region: Option<s3s::region::Region>,
-}
-
-#[derive(Clone, Copy)]
-enum AclTarget {
-    Bucket,
-    Object,
-}
-
-#[derive(Clone, Copy)]
-enum AclPermission {
-    Read,
-    Write,
-    ReadAcp,
-    WriteAcp,
-}
-
-fn acl_permission_for_action(action: &Action) -> Option<(AclTarget, AclPermission)> {
-    match action {
-        Action::S3Action(S3Action::ListBucketAction) => Some((AclTarget::Bucket, AclPermission::Read)),
-        Action::S3Action(S3Action::PutObjectAction) => Some((AclTarget::Bucket, AclPermission::Write)),
-        Action::S3Action(S3Action::GetBucketAclAction) => Some((AclTarget::Bucket, AclPermission::ReadAcp)),
-        Action::S3Action(S3Action::PutBucketAclAction) => Some((AclTarget::Bucket, AclPermission::WriteAcp)),
-        Action::S3Action(S3Action::GetObjectAction) => Some((AclTarget::Object, AclPermission::Read)),
-        Action::S3Action(S3Action::GetObjectAclAction) => Some((AclTarget::Object, AclPermission::ReadAcp)),
-        Action::S3Action(S3Action::PutObjectAclAction) => Some((AclTarget::Object, AclPermission::WriteAcp)),
-        _ => None,
-    }
-}
-
-fn permission_matches(grant_perm: &str, required: AclPermission) -> bool {
-    if grant_perm == Permission::FULL_CONTROL {
-        return true;
-    }
-
-    match required {
-        AclPermission::Read => grant_perm == Permission::READ,
-        AclPermission::Write => grant_perm == Permission::WRITE,
-        AclPermission::ReadAcp => grant_perm == Permission::READ_ACP,
-        AclPermission::WriteAcp => grant_perm == Permission::WRITE_ACP,
-    }
-}
-
-fn acl_allows(
-    acl: &StoredAcl,
-    user_id: Option<&str>,
-    is_authenticated: bool,
-    required: AclPermission,
-    ignore_public_acls: bool,
-) -> bool {
-    for grant in &acl.grants {
-        if !permission_matches(grant.permission.as_str(), required) {
-            continue;
-        }
-
-        match grant.grantee.grantee_type.as_str() {
-            "CanonicalUser" => {
-                if user_id.is_some_and(|id| grant.grantee.id.as_deref() == Some(id)) {
-                    return true;
-                }
-            }
-            "Group" => {
-                if ignore_public_acls {
-                    continue;
-                }
-                if let Some(uri) = grant.grantee.uri.as_deref() {
-                    if uri == ACL_GROUP_ALL_USERS {
-                        return true;
-                    }
-                    if uri == ACL_GROUP_AUTHENTICATED_USERS && is_authenticated {
-                        return true;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    false
-}
-
-async fn load_bucket_acl(bucket: &str) -> S3Result<StoredAcl> {
-    let owner = default_owner();
-    match metadata_sys::get_bucket_acl_config(bucket).await {
-        Ok((acl, _)) => Ok(parse_acl_json_or_canned_bucket(&acl, &owner)),
-        Err(err) => {
-            if err == StorageError::ConfigNotFound {
-                Ok(stored_acl_from_canned_bucket(BucketCannedACL::PRIVATE, &owner))
-            } else {
-                Err(S3Error::with_message(S3ErrorCode::InternalError, err.to_string()))
-            }
-        }
-    }
-}
-
-async fn load_object_acl(bucket: &str, object: &str, version_id: Option<&str>, headers: &http::HeaderMap) -> S3Result<StoredAcl> {
-    let Some(store) = new_object_layer_fn() else {
-        return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-    };
-
-    let opts = get_opts(bucket, object, version_id.map(|v| v.to_string()), None, headers)
-        .await
-        .map_err(ApiError::from)?;
-    let info = store.get_object_info(bucket, object, &opts).await.map_err(ApiError::from)?;
-
-    let bucket_owner = default_owner();
-    let object_owner = info
-        .user_defined
-        .get(INTERNAL_ACL_METADATA_KEY)
-        .and_then(|acl| serde_json::from_str::<StoredAcl>(acl).ok())
-        .map(|acl| acl.owner)
-        .unwrap_or_else(default_owner);
-
-    Ok(info
-        .user_defined
-        .get(INTERNAL_ACL_METADATA_KEY)
-        .map(|acl| parse_acl_json_or_canned_object(acl, &bucket_owner, &object_owner))
-        .unwrap_or_else(|| stored_acl_from_canned_object(ObjectCannedACL::PRIVATE, &bucket_owner, &object_owner)))
-}
-
-async fn check_acl_access<T>(req: &S3Request<T>, req_info: &ReqInfo, action: &Action, policy_allowed: bool) -> S3Result<bool> {
-    let Some((target, permission)) = acl_permission_for_action(action) else {
-        return Ok(true);
-    };
-
-    // For object-level operations, do not bypass on account-level is_owner.
-    // The bucket/account owner must have explicit ACL grant to access objects owned by others.
-    let bypass_owner = match target {
-        AclTarget::Bucket => req_info.is_owner,
-        AclTarget::Object => false,
-    };
-    if bypass_owner || policy_allowed {
-        return Ok(true);
-    }
-
-    let bucket = req_info.bucket.as_deref().unwrap_or("");
-    if bucket.is_empty() {
-        return Ok(true);
-    }
-
-    let ignore_public_acls = match metadata_sys::get_public_access_block_config(bucket).await {
-        Ok((config, _)) => config.ignore_public_acls.unwrap_or(false),
-        Err(_) => false,
-    };
-
-    let user_id = req_info.cred.as_ref().map(|cred| cred.access_key.as_str());
-    let is_authenticated = user_id.is_some();
-
-    let acl = match target {
-        AclTarget::Bucket => load_bucket_acl(bucket).await?,
-        AclTarget::Object => {
-            let object = req_info.object.as_deref().unwrap_or("");
-            if object.is_empty() {
-                return Ok(true);
-            }
-            load_object_acl(bucket, object, req_info.version_id.as_deref(), &req.headers).await?
-        }
-    };
-
-    Ok(acl_allows(&acl, user_id, is_authenticated, permission, ignore_public_acls))
 }
 
 pub(crate) fn req_info_ref<T>(req: &S3Request<T>) -> S3Result<&ReqInfo> {
@@ -259,6 +93,19 @@ impl FS {
     }
 }
 
+/// Returns true when the owner (root or parent=root credentials) may bypass bucket policy
+/// explicit Deny for this action. Per AWS S3, only GetBucketPolicy, PutBucketPolicy, and
+/// DeleteBucketPolicy have this bypass so the admin can recover from a misconfigured policy.
+pub(crate) fn owner_can_bypass_policy_deny(is_owner: bool, action: &Action) -> bool {
+    is_owner
+        && matches!(
+            action,
+            Action::S3Action(S3Action::GetBucketPolicyAction)
+                | Action::S3Action(S3Action::PutBucketPolicyAction)
+                | Action::S3Action(S3Action::DeleteBucketPolicyAction)
+        )
+}
+
 /// Authorizes the request based on the action and credentials.
 pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3Result<()> {
     let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
@@ -295,11 +142,17 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
         }
         let bucket_name = req_info.bucket.as_deref().unwrap_or("");
 
+        // Per AWS S3: root can always perform GetBucketPolicy, PutBucketPolicy, DeleteBucketPolicy
+        // even if bucket policy explicitly denies. Other actions (ListBucket, GetObject, etc.) are
+        // subject to bucket policy Deny for root as well. See: repost.aws/knowledge-center/s3-accidentally-denied-access
+        // Here "owner" means root or credentials whose parent_user is root (e.g. Console admin via STS).
+        let owner_can_bypass_deny = owner_can_bypass_policy_deny(req_info.is_owner, &action);
         if !bucket_name.is_empty()
+            && !owner_can_bypass_deny
             && !PolicySys::is_allowed(&BucketPolicyArgs {
                 bucket: bucket_name,
                 action,
-                // Run this early check in deny-only mode so ACL/IAM fallbacks can still grant access.
+                // Run this early check in deny-only mode so IAM fallback can still grant access.
                 is_owner: true,
                 account: &cred.access_key,
                 groups: &cred.groups,
@@ -355,26 +208,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
             .await;
 
         if iam_allowed {
-            let policy_allowed = if !bucket_name.is_empty() {
-                PolicySys::is_allowed(&BucketPolicyArgs {
-                    bucket: bucket_name,
-                    action,
-                    is_owner: false,
-                    account: &cred.access_key,
-                    groups: &cred.groups,
-                    conditions: &conditions,
-                    object: req_info.object.as_deref().unwrap_or(""),
-                })
-                .await
-            } else {
-                false
-            };
-
-            if check_acl_access(req, req_info, &action, policy_allowed).await? {
-                return Ok(());
-            }
-
-            return Err(s3_error!(AccessDenied, "Access Denied"));
+            return Ok(());
         }
 
         let policy_allowed_fallback = PolicySys::is_allowed(&BucketPolicyArgs {
@@ -389,13 +223,6 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
         .await;
 
         if policy_allowed_fallback {
-            // For object-level operations, bucket owner (is_owner) must still pass ACL check.
-            // Policy may have allowed due to is_owner, but object owner is authoritative.
-            if let Some((AclTarget::Object, _)) = acl_permission_for_action(&action)
-                && !check_acl_access(req, req_info, &action, false).await?
-            {
-                return Err(s3_error!(AccessDenied, "Access Denied"));
-            }
             return Ok(());
         }
 
@@ -455,7 +282,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
             && !PolicySys::is_allowed(&BucketPolicyArgs {
                 bucket: bucket_name,
                 action,
-                // Run this early check in deny-only mode so ACL checks are not bypassed.
+                // Run this early check in deny-only mode so later policy checks are not bypassed.
                 is_owner: true,
                 account: "",
                 groups: &None,
@@ -509,10 +336,6 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
             {
                 return Ok(());
             }
-
-            if acl_permission_for_action(&action).is_some() && check_acl_access(req, req_info, &action, false).await? {
-                return Ok(());
-            }
         }
     }
 
@@ -532,16 +355,8 @@ fn get_bucket_policy_authorize_action() -> Action {
     Action::S3Action(S3Action::GetBucketPolicyAction)
 }
 
-fn get_object_acl_authorize_action() -> Action {
-    Action::S3Action(S3Action::GetObjectAclAction)
-}
-
 fn put_bucket_policy_authorize_action() -> Action {
     Action::S3Action(S3Action::PutBucketPolicyAction)
-}
-
-fn put_object_acl_authorize_action() -> Action {
-    Action::S3Action(S3Action::PutObjectAclAction)
 }
 
 #[async_trait::async_trait]
@@ -635,6 +450,7 @@ impl S3Access for FS {
         {
             let (src_bucket, src_key, version_id) = match &req.input.copy_source {
                 CopySource::AccessPoint { .. } => return Err(s3_error!(NotImplemented)),
+                CopySource::Outpost { .. } => return Err(s3_error!(NotImplemented)),
                 CopySource::Bucket { bucket, key, version_id } => {
                     (bucket.to_string(), key.to_string(), version_id.as_ref().map(|v| v.to_string()))
                 }
@@ -1104,12 +920,7 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        let tag_conds = self
-            .fetch_tag_conditions(&req.input.bucket, &req.input.key, req.input.version_id.as_deref(), "get_object_acl")
-            .await?;
-        req.extensions.insert(tag_conds);
-
-        authorize_request(req, get_object_acl_authorize_action()).await
+        authorize_request(req, Action::S3Action(S3Action::GetObjectAclAction)).await
     }
 
     /// Checks whether the GetObjectAttributes request has accesses to the resources.
@@ -1526,12 +1337,7 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        let tag_conds = self
-            .fetch_tag_conditions(&req.input.bucket, &req.input.key, req.input.version_id.as_deref(), "put_object_acl")
-            .await?;
-        req.extensions.insert(tag_conds);
-
-        authorize_request(req, put_object_acl_authorize_action()).await
+        authorize_request(req, Action::S3Action(S3Action::PutObjectAclAction)).await
     }
 
     /// Checks whether the PutObjectLegalHold request has accesses to the resources.
@@ -1660,18 +1466,8 @@ mod tests {
     }
 
     #[test]
-    fn get_object_acl_uses_get_object_acl_action() {
-        assert_eq!(get_object_acl_authorize_action(), Action::S3Action(S3Action::GetObjectAclAction));
-    }
-
-    #[test]
     fn put_bucket_policy_uses_put_bucket_policy_action() {
         assert_eq!(put_bucket_policy_authorize_action(), Action::S3Action(S3Action::PutBucketPolicyAction));
-    }
-
-    #[test]
-    fn put_object_acl_uses_put_object_acl_action() {
-        assert_eq!(put_object_acl_authorize_action(), Action::S3Action(S3Action::PutObjectAclAction));
     }
 
     /// Object tag conditions must use keys like ExistingObjectTag/<tag-key> so that
@@ -1697,5 +1493,25 @@ mod tests {
     async fn test_bucket_policy_uses_existing_object_tag_no_policy() {
         let result = bucket_policy_uses_existing_object_tag("test-bucket-no-policy-xyz-absent").await;
         assert!(!result, "bucket with no policy should not use ExistingObjectTag");
+    }
+
+    /// Owner can bypass bucket policy Deny only for the three policy management APIs (per AWS S3).
+    #[test]
+    fn test_owner_can_bypass_policy_deny_only_for_policy_apis() {
+        // Owner + policy management actions -> bypass allowed
+        assert!(owner_can_bypass_policy_deny(true, &Action::S3Action(S3Action::GetBucketPolicyAction)));
+        assert!(owner_can_bypass_policy_deny(true, &Action::S3Action(S3Action::PutBucketPolicyAction)));
+        assert!(owner_can_bypass_policy_deny(true, &Action::S3Action(S3Action::DeleteBucketPolicyAction)));
+
+        // Owner + other actions -> no bypass (still subject to bucket policy Deny)
+        assert!(!owner_can_bypass_policy_deny(true, &Action::S3Action(S3Action::ListBucketAction)));
+        assert!(!owner_can_bypass_policy_deny(true, &Action::S3Action(S3Action::GetObjectAction)));
+
+        // Non-owner -> no bypass for any action
+        assert!(!owner_can_bypass_policy_deny(false, &Action::S3Action(S3Action::GetBucketPolicyAction)));
+        assert!(!owner_can_bypass_policy_deny(
+            false,
+            &Action::S3Action(S3Action::DeleteBucketPolicyAction)
+        ));
     }
 }

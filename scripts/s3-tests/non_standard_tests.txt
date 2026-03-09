@@ -1,8 +1,9 @@
-# Non-standard S3 tests (Ceph/RGW/MinIO specific)
-# ================================================
+# Legacy non-standard S3 test list (compatibility fallback)
+# =========================================================
 #
+# This file is kept for backward compatibility.
+# Active exclusion classification now uses excluded_tests.txt.
 # These tests use vendor-specific extensions not part of AWS S3 API.
-# They are PERMANENTLY EXCLUDED from RustFS compatibility testing.
 #
 # Exclusion reasons:
 # - fails_on_aws marker: Ceph-specific features

@@ -17,7 +17,7 @@
 use crate::app::context::{AppContext, default_notify_interface, get_global_app_context};
 use crate::config::workload_profiles::RustFSBufferConfig;
 use crate::error::ApiError;
-use crate::storage::access::{ReqInfo, authorize_request, has_bypass_governance_header, req_info_mut};
+use crate::storage::access::{authorize_request, has_bypass_governance_header, req_info_mut};
 use crate::storage::concurrency::{
     CachedGetObject, ConcurrencyManager, GetObjectGuard, get_concurrency_aware_buffer_size, get_concurrency_manager,
 };
@@ -29,7 +29,7 @@ use crate::storage::options::{
     filter_object_metadata, get_content_sha256_with_query, get_opts, put_opts,
 };
 use crate::storage::s3_api::multipart::parse_list_parts_params;
-use crate::storage::s3_api::{restore, select};
+use crate::storage::s3_api::{acl, restore, select};
 use crate::storage::*;
 use bytes::Bytes;
 use datafusion::arrow::{
@@ -74,6 +74,7 @@ use rustfs_filemeta::{
 use rustfs_notify::EventArgsBuilder;
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_rio::{CompressReader, EtagReader, HashReader, Reader, WarpReader};
+use rustfs_s3_common::S3Operation;
 use rustfs_s3select_api::{
     object_store::bytes_stream,
     query::{Context, Query},
@@ -266,7 +267,7 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
-        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, "s3:PutObject");
+        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, S3Operation::PutObject);
         if req
             .headers
             .get("X-Amz-Meta-Snowball-Auto-Extract")
@@ -287,11 +288,6 @@ impl DefaultObjectUsecase {
             body,
             bucket,
             key,
-            acl,
-            grant_full_control,
-            grant_read,
-            grant_read_acp,
-            grant_write_acp,
             content_length,
             content_type,
             tagging,
@@ -317,14 +313,6 @@ impl DefaultObjectUsecase {
 
         // Validate object key
         validate_object_key(&key, "PUT")?;
-
-        if let Some(acl) = &acl
-            && let Ok((config, _)) = metadata_sys::get_public_access_block_config(&bucket).await
-            && config.block_public_acls.unwrap_or(false)
-            && is_public_canned_acl(acl.as_str())
-        {
-            return Err(s3_error!(AccessDenied, "Access Denied"));
-        }
 
         if let Some(size) = content_length {
             self.check_bucket_quota(&bucket, QuotaOperation::PutObject, size as u64)
@@ -407,33 +395,6 @@ impl DefaultObjectUsecase {
         )?;
 
         let mut metadata = metadata.unwrap_or_default();
-        let owner = req
-            .extensions
-            .get::<ReqInfo>()
-            .and_then(|info| info.cred.as_ref())
-            .map(|cred| owner_from_access_key(&cred.access_key))
-            .unwrap_or_else(default_owner);
-        let bucket_owner = default_owner();
-        let mut stored_acl = stored_acl_from_grant_headers(
-            &owner,
-            grant_read.map(|v| v.to_string()),
-            None,
-            grant_read_acp.map(|v| v.to_string()),
-            grant_write_acp.map(|v| v.to_string()),
-            grant_full_control.map(|v| v.to_string()),
-        )?;
-
-        if stored_acl.is_none()
-            && let Some(canned) = acl.as_ref()
-        {
-            stored_acl = Some(stored_acl_from_canned_object(canned.as_str(), &bucket_owner, &owner));
-        }
-
-        let stored_acl =
-            stored_acl.unwrap_or_else(|| stored_acl_from_canned_object(ObjectCannedACL::PRIVATE, &bucket_owner, &owner));
-        let acl_data = serialize_acl(&stored_acl)?;
-        metadata.insert(INTERNAL_ACL_METADATA_KEY.to_string(), String::from_utf8_lossy(&acl_data).to_string());
-
         if let Some(content_type) = content_type {
             metadata.insert("content-type".to_string(), content_type.to_string());
         }
@@ -622,13 +583,7 @@ impl DefaultObjectUsecase {
         let PutObjectAclInput {
             bucket,
             key,
-            acl,
             access_control_policy,
-            grant_full_control,
-            grant_read,
-            grant_read_acp,
-            grant_write,
-            grant_write_acp,
             version_id,
             ..
         } = req.input;
@@ -640,63 +595,14 @@ impl DefaultObjectUsecase {
         let opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
             .await
             .map_err(ApiError::from)?;
-        let info = store.get_object_info(&bucket, &key, &opts).await.map_err(ApiError::from)?;
+        store.get_object_info(&bucket, &key, &opts).await.map_err(ApiError::from)?;
 
-        let bucket_owner = default_owner();
-        let existing_owner = info
-            .user_defined
-            .get(INTERNAL_ACL_METADATA_KEY)
-            .and_then(|acl| serde_json::from_str::<StoredAcl>(acl).ok())
-            .map(|acl| acl.owner)
-            .unwrap_or_else(|| bucket_owner.clone());
-
-        let mut stored_acl = access_control_policy
-            .as_ref()
-            .map(|policy| stored_acl_from_policy(policy, &existing_owner))
-            .transpose()?;
-
-        if stored_acl.is_none() {
-            stored_acl = stored_acl_from_grant_headers(
-                &existing_owner,
-                grant_read.map(|v| v.to_string()),
-                grant_write.map(|v| v.to_string()),
-                grant_read_acp.map(|v| v.to_string()),
-                grant_write_acp.map(|v| v.to_string()),
-                grant_full_control.map(|v| v.to_string()),
-            )?;
+        if access_control_policy.is_some() {
+            return Err(s3_error!(
+                NotImplemented,
+                "ACL XML grants are not supported; use canned ACL headers or omit ACL"
+            ));
         }
-
-        if stored_acl.is_none()
-            && let Some(canned) = acl
-        {
-            stored_acl = Some(stored_acl_from_canned_object(canned.as_str(), &bucket_owner, &existing_owner));
-        }
-
-        let stored_acl =
-            stored_acl.unwrap_or_else(|| stored_acl_from_canned_object(ObjectCannedACL::PRIVATE, &bucket_owner, &existing_owner));
-
-        if let Ok((config, _)) = metadata_sys::get_public_access_block_config(&bucket).await
-            && config.block_public_acls.unwrap_or(false)
-            && stored_acl.grants.iter().any(is_public_grant)
-        {
-            return Err(s3_error!(AccessDenied, "Access Denied"));
-        }
-
-        let acl_data = serialize_acl(&stored_acl)?;
-        let mut eval_metadata = HashMap::new();
-        eval_metadata.insert(INTERNAL_ACL_METADATA_KEY.to_string(), String::from_utf8_lossy(&acl_data).to_string());
-
-        let popts = ObjectOptions {
-            mod_time: info.mod_time,
-            version_id: opts.version_id,
-            eval_metadata: Some(eval_metadata),
-            ..Default::default()
-        };
-
-        store.put_object_metadata(&bucket, &key, &popts).await.map_err(|e| {
-            error!("put_object_metadata failed, {}", e.to_string());
-            s3_error!(InternalError, "{}", e.to_string())
-        })?;
 
         Ok(S3Response::new(PutObjectAclOutput::default()))
     }
@@ -709,7 +615,7 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
-        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedPutLegalHold, "s3:PutObjectLegalHold");
+        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedPutLegalHold, S3Operation::PutObjectLegalHold);
         let PutObjectLegalHoldInput {
             bucket,
             key,
@@ -838,7 +744,7 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
-        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedPutRetention, "s3:PutObjectRetention");
+        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedPutRetention, S3Operation::PutObjectRetention);
         let PutObjectRetentionInput {
             bucket,
             key,
@@ -930,7 +836,7 @@ impl DefaultObjectUsecase {
         }
 
         let start_time = std::time::Instant::now();
-        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedPutTagging, "s3:PutObjectTagging");
+        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedPutTagging, S3Operation::PutObjectTagging);
         let PutObjectTaggingInput {
             bucket,
             key: object,
@@ -1039,7 +945,7 @@ impl DefaultObjectUsecase {
 
         debug!("GetObject request started with {} concurrent requests", concurrent_requests);
 
-        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, "s3:GetObject");
+        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject);
         // mc get 3
 
         let GetObjectInput {
@@ -1606,31 +1512,9 @@ impl DefaultObjectUsecase {
         let opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
             .await
             .map_err(ApiError::from)?;
-        let info = store.get_object_info(&bucket, &key, &opts).await.map_err(ApiError::from)?;
+        store.get_object_info(&bucket, &key, &opts).await.map_err(ApiError::from)?;
 
-        let bucket_owner = default_owner();
-        let object_owner = info
-            .user_defined
-            .get(INTERNAL_ACL_METADATA_KEY)
-            .and_then(|acl| serde_json::from_str::<StoredAcl>(acl).ok())
-            .map(|acl| acl.owner)
-            .unwrap_or_else(default_owner);
-
-        let stored_acl = info
-            .user_defined
-            .get(INTERNAL_ACL_METADATA_KEY)
-            .map(|acl| parse_acl_json_or_canned_object(acl, &bucket_owner, &object_owner))
-            .unwrap_or_else(|| stored_acl_from_canned_object(ObjectCannedACL::PRIVATE, &bucket_owner, &object_owner));
-
-        let mut sorted_grants = stored_acl.grants.clone();
-        sorted_grants.sort_by_key(|grant| grant.grantee.grantee_type != "Group");
-        let grants = sorted_grants.iter().map(stored_grant_to_dto).collect();
-
-        Ok(S3Response::new(GetObjectAclOutput {
-            grants: Some(grants),
-            owner: Some(stored_owner_to_dto(&stored_acl.owner)),
-            ..Default::default()
-        }))
+        Ok(S3Response::new(acl::build_get_object_acl_output()))
     }
 
     pub async fn execute_get_object_attributes(
@@ -1641,7 +1525,7 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
-        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedAttributes, "s3:GetObjectAttributes");
+        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedAttributes, S3Operation::GetObjectAttributes);
         let GetObjectAttributesInput {
             bucket,
             key,
@@ -1873,7 +1757,7 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
-        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedGetLegalHold, "s3:GetObjectLegalHold");
+        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedGetLegalHold, S3Operation::GetObjectLegalHold);
         let GetObjectLegalHoldInput {
             bucket, key, version_id, ..
         } = req.input.clone();
@@ -1964,7 +1848,7 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
-        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedGetRetention, "s3:GetObjectRetention");
+        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedGetRetention, S3Operation::GetObjectRetention);
         let GetObjectRetentionInput {
             bucket, key, version_id, ..
         } = req.input.clone();
@@ -2058,7 +1942,7 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
-        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedCopy, "s3:CopyObject");
+        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedCopy, S3Operation::CopyObject);
         let CopyObjectInput {
             copy_source,
             bucket,
@@ -2079,6 +1963,7 @@ impl DefaultObjectUsecase {
         } = req.input.clone();
         let (src_bucket, src_key, version_id) = match copy_source {
             CopySource::AccessPoint { .. } => return Err(s3_error!(NotImplemented)),
+            CopySource::Outpost { .. } => return Err(s3_error!(NotImplemented)),
             CopySource::Bucket {
                 ref bucket,
                 ref key,
@@ -2353,7 +2238,7 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
-        let helper = OperationHelper::new(&req, EventName::ObjectRemovedDelete, "s3:DeleteObjects").suppress_event();
+        let helper = OperationHelper::new(&req, EventName::ObjectRemovedDelete, S3Operation::DeleteObjects).suppress_event();
         let (bucket, delete) = {
             let bucket = req.input.bucket.clone();
             let delete = req.input.delete.clone();
@@ -2654,7 +2539,7 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
-        let mut helper = OperationHelper::new(&req, EventName::ObjectRemovedDelete, "s3:DeleteObject");
+        let mut helper = OperationHelper::new(&req, EventName::ObjectRemovedDelete, S3Operation::DeleteObject);
         let DeleteObjectInput {
             bucket, key, version_id, ..
         } = req.input.clone();
@@ -2783,6 +2668,7 @@ impl DefaultObjectUsecase {
         }
 
         if obj_info.replication_status == ReplicationStatusType::Replica
+            || obj_info.replication_status == ReplicationStatusType::Pending
             || obj_info.version_purge_status == VersionPurgeStatusType::Pending
         {
             schedule_replication_delete(DeletedObjectReplicationInfo {
@@ -2837,7 +2723,7 @@ impl DefaultObjectUsecase {
         }
 
         let start_time = std::time::Instant::now();
-        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedDeleteTagging, "s3:DeleteObjectTagging");
+        let mut helper = OperationHelper::new(&req, EventName::ObjectCreatedDeleteTagging, S3Operation::DeleteObjectTagging);
         let DeleteObjectTaggingInput {
             bucket,
             key: object,
@@ -2891,7 +2777,7 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
-        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedHead, "s3:HeadObject");
+        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedHead, S3Operation::HeadObject);
         // mc get 2
         let HeadObjectInput {
             bucket,
@@ -3467,7 +3353,7 @@ impl DefaultObjectUsecase {
 
     #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_put_object_extract(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
-        let helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, "s3:PutObject").suppress_event();
+        let helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, S3Operation::PutObject).suppress_event();
         let input = req.input;
 
         let PutObjectInput {

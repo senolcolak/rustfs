@@ -21,8 +21,8 @@ use rustfs_ecstore::{
     new_object_layer_fn,
     store_api::{BucketOperations, BucketOptions, ObjectOperations, ObjectOptions},
 };
+use rustfs_s3_common::{S3Operation, record_s3_op};
 use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto::*, s3_error};
-use serde::{Deserialize, Serialize};
 use std::{fmt::Debug, sync::LazyLock};
 use tokio::io::{AsyncRead, AsyncSeek};
 use tracing::{debug, error, instrument, warn};
@@ -30,509 +30,21 @@ use uuid::Uuid;
 
 const DEFAULT_OWNER_ID: &str = "rustfsadmin";
 const DEFAULT_OWNER_DISPLAY_NAME: &str = "RustFS Tester";
-const DEFAULT_OWNER_EMAIL: &str = "tester@rustfs.local";
-const DEFAULT_ALT_ID: &str = "rustfsalt";
-const DEFAULT_ALT_DISPLAY_NAME: &str = "RustFS Alt Tester";
-const DEFAULT_ALT_EMAIL: &str = "alt@rustfs.local";
-
-pub(crate) const INTERNAL_ACL_METADATA_KEY: &str = "x-rustfs-internal-acl";
 
 pub(crate) static RUSTFS_OWNER: LazyLock<Owner> = LazyLock::new(|| Owner {
     display_name: Some(DEFAULT_OWNER_DISPLAY_NAME.to_owned()),
     id: Some(DEFAULT_OWNER_ID.to_owned()),
 });
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct StoredOwner {
     pub(crate) id: String,
-    pub(crate) display_name: String,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub(crate) struct StoredGrantee {
-    pub(crate) grantee_type: String,
-    pub(crate) id: Option<String>,
-    pub(crate) display_name: Option<String>,
-    pub(crate) uri: Option<String>,
-    pub(crate) email_address: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct StoredGrant {
-    pub(crate) grantee: StoredGrantee,
-    pub(crate) permission: String,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub(crate) struct StoredAcl {
-    pub(crate) owner: StoredOwner,
-    pub(crate) grants: Vec<StoredGrant>,
 }
 
 pub(crate) fn default_owner() -> StoredOwner {
     StoredOwner {
         id: DEFAULT_OWNER_ID.to_string(),
-        display_name: DEFAULT_OWNER_DISPLAY_NAME.to_string(),
     }
-}
-
-pub(crate) fn owner_from_access_key(access_key: &str) -> StoredOwner {
-    if access_key == DEFAULT_OWNER_ID {
-        return default_owner();
-    }
-    if access_key == DEFAULT_ALT_ID {
-        return StoredOwner {
-            id: DEFAULT_ALT_ID.to_string(),
-            display_name: DEFAULT_ALT_DISPLAY_NAME.to_string(),
-        };
-    }
-
-    StoredOwner {
-        id: access_key.to_string(),
-        display_name: access_key.to_string(),
-    }
-}
-
-fn user_id_from_email(email: &str) -> Option<StoredOwner> {
-    if email.eq_ignore_ascii_case(DEFAULT_OWNER_EMAIL) {
-        return Some(default_owner());
-    }
-    if email.eq_ignore_ascii_case(DEFAULT_ALT_EMAIL) {
-        return Some(StoredOwner {
-            id: DEFAULT_ALT_ID.to_string(),
-            display_name: DEFAULT_ALT_DISPLAY_NAME.to_string(),
-        });
-    }
-
-    None
-}
-
-fn display_name_for_user_id(user_id: &str) -> Option<String> {
-    if user_id == DEFAULT_OWNER_ID {
-        return Some(DEFAULT_OWNER_DISPLAY_NAME.to_string());
-    }
-    if user_id == DEFAULT_ALT_ID {
-        return Some(DEFAULT_ALT_DISPLAY_NAME.to_string());
-    }
-
-    None
-}
-
-fn is_known_user_id(user_id: &str) -> bool {
-    user_id == DEFAULT_OWNER_ID || user_id == DEFAULT_ALT_ID
-}
-
-pub(crate) fn stored_owner_to_dto(owner: &StoredOwner) -> Owner {
-    Owner {
-        id: Some(owner.id.clone()),
-        display_name: Some(owner.display_name.clone()),
-    }
-}
-
-pub(crate) fn stored_grant_to_dto(grant: &StoredGrant) -> Grant {
-    let grantee = match grant.grantee.grantee_type.as_str() {
-        "Group" => Grantee {
-            type_: Type::from_static(Type::GROUP),
-            display_name: None,
-            email_address: None,
-            id: None,
-            uri: grant.grantee.uri.clone(),
-        },
-        _ => Grantee {
-            type_: Type::from_static(Type::CANONICAL_USER),
-            display_name: grant.grantee.display_name.clone(),
-            email_address: None,
-            id: grant.grantee.id.clone(),
-            uri: None,
-        },
-    };
-
-    Grant {
-        grantee: Some(grantee),
-        permission: Some(Permission::from(grant.permission.clone())),
-    }
-}
-
-pub(crate) fn is_public_grant(grant: &StoredGrant) -> bool {
-    matches!(grant.grantee.grantee_type.as_str(), "Group")
-        && grant
-            .grantee
-            .uri
-            .as_deref()
-            .is_some_and(|uri| uri == ACL_GROUP_ALL_USERS || uri == ACL_GROUP_AUTHENTICATED_USERS)
-}
-
-fn grants_for_canned_bucket_acl(acl: &str, owner: &StoredOwner) -> Vec<StoredGrant> {
-    let mut grants = Vec::new();
-
-    match acl {
-        BucketCannedACL::PUBLIC_READ => {
-            grants.push(StoredGrant {
-                grantee: StoredGrantee {
-                    grantee_type: "Group".to_string(),
-                    id: None,
-                    display_name: None,
-                    uri: Some(ACL_GROUP_ALL_USERS.to_string()),
-                    email_address: None,
-                },
-                permission: Permission::READ.to_string(),
-            });
-        }
-        BucketCannedACL::PUBLIC_READ_WRITE => {
-            grants.push(StoredGrant {
-                grantee: StoredGrantee {
-                    grantee_type: "Group".to_string(),
-                    id: None,
-                    display_name: None,
-                    uri: Some(ACL_GROUP_ALL_USERS.to_string()),
-                    email_address: None,
-                },
-                permission: Permission::READ.to_string(),
-            });
-            grants.push(StoredGrant {
-                grantee: StoredGrantee {
-                    grantee_type: "Group".to_string(),
-                    id: None,
-                    display_name: None,
-                    uri: Some(ACL_GROUP_ALL_USERS.to_string()),
-                    email_address: None,
-                },
-                permission: Permission::WRITE.to_string(),
-            });
-        }
-        BucketCannedACL::AUTHENTICATED_READ => {
-            grants.push(StoredGrant {
-                grantee: StoredGrantee {
-                    grantee_type: "Group".to_string(),
-                    id: None,
-                    display_name: None,
-                    uri: Some(ACL_GROUP_AUTHENTICATED_USERS.to_string()),
-                    email_address: None,
-                },
-                permission: Permission::READ.to_string(),
-            });
-        }
-        _ => {}
-    }
-
-    grants.push(StoredGrant {
-        grantee: StoredGrantee {
-            grantee_type: "CanonicalUser".to_string(),
-            id: Some(owner.id.clone()),
-            display_name: Some(owner.display_name.clone()),
-            uri: None,
-            email_address: None,
-        },
-        permission: Permission::FULL_CONTROL.to_string(),
-    });
-
-    grants
-}
-
-fn grants_for_canned_object_acl(acl: &str, bucket_owner: &StoredOwner, object_owner: &StoredOwner) -> Vec<StoredGrant> {
-    let mut grants = Vec::new();
-
-    match acl {
-        ObjectCannedACL::PUBLIC_READ => {
-            grants.push(StoredGrant {
-                grantee: StoredGrantee {
-                    grantee_type: "Group".to_string(),
-                    id: None,
-                    display_name: None,
-                    uri: Some(ACL_GROUP_ALL_USERS.to_string()),
-                    email_address: None,
-                },
-                permission: Permission::READ.to_string(),
-            });
-        }
-        ObjectCannedACL::PUBLIC_READ_WRITE => {
-            grants.push(StoredGrant {
-                grantee: StoredGrantee {
-                    grantee_type: "Group".to_string(),
-                    id: None,
-                    display_name: None,
-                    uri: Some(ACL_GROUP_ALL_USERS.to_string()),
-                    email_address: None,
-                },
-                permission: Permission::READ.to_string(),
-            });
-            grants.push(StoredGrant {
-                grantee: StoredGrantee {
-                    grantee_type: "Group".to_string(),
-                    id: None,
-                    display_name: None,
-                    uri: Some(ACL_GROUP_ALL_USERS.to_string()),
-                    email_address: None,
-                },
-                permission: Permission::WRITE.to_string(),
-            });
-        }
-        ObjectCannedACL::AUTHENTICATED_READ => {
-            grants.push(StoredGrant {
-                grantee: StoredGrantee {
-                    grantee_type: "Group".to_string(),
-                    id: None,
-                    display_name: None,
-                    uri: Some(ACL_GROUP_AUTHENTICATED_USERS.to_string()),
-                    email_address: None,
-                },
-                permission: Permission::READ.to_string(),
-            });
-        }
-        ObjectCannedACL::BUCKET_OWNER_READ => {
-            grants.push(StoredGrant {
-                grantee: StoredGrantee {
-                    grantee_type: "CanonicalUser".to_string(),
-                    id: Some(bucket_owner.id.clone()),
-                    display_name: Some(bucket_owner.display_name.clone()),
-                    uri: None,
-                    email_address: None,
-                },
-                permission: Permission::READ.to_string(),
-            });
-        }
-        ObjectCannedACL::BUCKET_OWNER_FULL_CONTROL => {
-            grants.push(StoredGrant {
-                grantee: StoredGrantee {
-                    grantee_type: "CanonicalUser".to_string(),
-                    id: Some(bucket_owner.id.clone()),
-                    display_name: Some(bucket_owner.display_name.clone()),
-                    uri: None,
-                    email_address: None,
-                },
-                permission: Permission::FULL_CONTROL.to_string(),
-            });
-        }
-        _ => {}
-    }
-
-    grants.push(StoredGrant {
-        grantee: StoredGrantee {
-            grantee_type: "CanonicalUser".to_string(),
-            id: Some(object_owner.id.clone()),
-            display_name: Some(object_owner.display_name.clone()),
-            uri: None,
-            email_address: None,
-        },
-        permission: Permission::FULL_CONTROL.to_string(),
-    });
-
-    grants
-}
-
-pub(crate) fn stored_acl_from_canned_bucket(acl: &str, owner: &StoredOwner) -> StoredAcl {
-    StoredAcl {
-        owner: owner.clone(),
-        grants: grants_for_canned_bucket_acl(acl, owner),
-    }
-}
-
-pub(crate) fn stored_acl_from_canned_object(acl: &str, bucket_owner: &StoredOwner, object_owner: &StoredOwner) -> StoredAcl {
-    StoredAcl {
-        owner: object_owner.clone(),
-        grants: grants_for_canned_object_acl(acl, bucket_owner, object_owner),
-    }
-}
-
-pub(crate) fn parse_acl_json_or_canned_bucket(data: &str, owner: &StoredOwner) -> StoredAcl {
-    match serde_json::from_str::<StoredAcl>(data) {
-        Ok(acl) => acl,
-        Err(_) => stored_acl_from_canned_bucket(data, owner),
-    }
-}
-
-pub(crate) fn parse_acl_json_or_canned_object(data: &str, bucket_owner: &StoredOwner, object_owner: &StoredOwner) -> StoredAcl {
-    match serde_json::from_str::<StoredAcl>(data) {
-        Ok(acl) => acl,
-        Err(_) => stored_acl_from_canned_object(data, bucket_owner, object_owner),
-    }
-}
-
-pub(crate) fn serialize_acl(acl: &StoredAcl) -> std::result::Result<Vec<u8>, S3Error> {
-    serde_json::to_vec(acl).map_err(|e| s3_error!(InternalError, "serialize acl failed {e}"))
-}
-
-fn grantee_from_grant(grantee: &Grantee) -> Result<StoredGrantee, S3Error> {
-    match grantee.type_.as_str() {
-        Type::GROUP => {
-            let uri = grantee
-                .uri
-                .clone()
-                .filter(|uri| uri == ACL_GROUP_ALL_USERS || uri == ACL_GROUP_AUTHENTICATED_USERS)
-                .ok_or_else(|| s3_error!(InvalidArgument))?;
-
-            Ok(StoredGrantee {
-                grantee_type: "Group".to_string(),
-                id: None,
-                display_name: None,
-                uri: Some(uri),
-                email_address: None,
-            })
-        }
-        Type::CANONICAL_USER => {
-            let id = grantee.id.clone().ok_or_else(|| s3_error!(InvalidArgument))?;
-            if !is_known_user_id(&id) {
-                return Err(s3_error!(InvalidArgument));
-            }
-            let display_name = display_name_for_user_id(&id).or_else(|| grantee.display_name.clone());
-
-            Ok(StoredGrantee {
-                grantee_type: "CanonicalUser".to_string(),
-                id: Some(id),
-                display_name,
-                uri: None,
-                email_address: None,
-            })
-        }
-        Type::AMAZON_CUSTOMER_BY_EMAIL => {
-            let email = grantee.email_address.clone().ok_or_else(|| s3_error!(InvalidArgument))?;
-            let owner = user_id_from_email(&email).ok_or_else(|| s3_error!(UnresolvableGrantByEmailAddress))?;
-
-            Ok(StoredGrantee {
-                grantee_type: "CanonicalUser".to_string(),
-                id: Some(owner.id),
-                display_name: Some(owner.display_name),
-                uri: None,
-                email_address: None,
-            })
-        }
-        _ => Err(s3_error!(InvalidArgument)),
-    }
-}
-
-pub(crate) fn stored_acl_from_policy(policy: &AccessControlPolicy, owner_fallback: &StoredOwner) -> Result<StoredAcl, S3Error> {
-    let owner = policy
-        .owner
-        .as_ref()
-        .and_then(|owner| {
-            let id = owner.id.clone()?;
-            let display_name = owner.display_name.clone()?;
-            Some(StoredOwner { id, display_name })
-        })
-        .unwrap_or_else(|| owner_fallback.clone());
-
-    let grants = policy
-        .grants
-        .clone()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|grant| {
-            let permission = grant
-                .permission
-                .clone()
-                .ok_or_else(|| s3_error!(InvalidArgument))?
-                .as_str()
-                .to_string();
-            let grantee = grant
-                .grantee
-                .as_ref()
-                .ok_or_else(|| s3_error!(InvalidArgument))
-                .and_then(grantee_from_grant)?;
-            Ok(StoredGrant { grantee, permission })
-        })
-        .collect::<Result<Vec<_>, S3Error>>()?;
-
-    Ok(StoredAcl { owner, grants })
-}
-
-fn parse_grant_header(value: &str) -> Result<Vec<StoredGrantee>, S3Error> {
-    let mut grantees = Vec::new();
-    for entry in value.split(',') {
-        let entry = entry.trim();
-        if entry.is_empty() {
-            continue;
-        }
-        let mut parts = entry.splitn(2, '=');
-        let key = parts.next().unwrap_or_default().trim();
-        let val = parts.next().unwrap_or_default().trim();
-        match key {
-            "id" => {
-                if !is_known_user_id(val) {
-                    return Err(s3_error!(InvalidArgument));
-                }
-                grantees.push(StoredGrantee {
-                    grantee_type: "CanonicalUser".to_string(),
-                    id: Some(val.to_string()),
-                    display_name: display_name_for_user_id(val),
-                    uri: None,
-                    email_address: None,
-                });
-            }
-            "uri" => {
-                if val != ACL_GROUP_ALL_USERS && val != ACL_GROUP_AUTHENTICATED_USERS {
-                    return Err(s3_error!(InvalidArgument));
-                }
-                grantees.push(StoredGrantee {
-                    grantee_type: "Group".to_string(),
-                    id: None,
-                    display_name: None,
-                    uri: Some(val.to_string()),
-                    email_address: None,
-                });
-            }
-            "emailAddress" => {
-                let owner = user_id_from_email(val).ok_or_else(|| s3_error!(UnresolvableGrantByEmailAddress))?;
-                grantees.push(StoredGrantee {
-                    grantee_type: "CanonicalUser".to_string(),
-                    id: Some(owner.id),
-                    display_name: Some(owner.display_name),
-                    uri: None,
-                    email_address: None,
-                });
-            }
-            _ => return Err(s3_error!(InvalidArgument)),
-        }
-    }
-    Ok(grantees)
-}
-
-pub(crate) fn stored_acl_from_grant_headers(
-    owner: &StoredOwner,
-    grant_read: Option<String>,
-    grant_write: Option<String>,
-    grant_read_acp: Option<String>,
-    grant_write_acp: Option<String>,
-    grant_full_control: Option<String>,
-) -> Result<Option<StoredAcl>, S3Error> {
-    let mut grants = Vec::new();
-
-    let mut push_grants = |value: Option<String>, permission: &str| -> Result<(), S3Error> {
-        if let Some(value) = value {
-            for grantee in parse_grant_header(&value)? {
-                grants.push(StoredGrant {
-                    grantee,
-                    permission: permission.to_string(),
-                });
-            }
-        }
-        Ok(())
-    };
-
-    push_grants(grant_read, Permission::READ)?;
-    push_grants(grant_write, Permission::WRITE)?;
-    push_grants(grant_read_acp, Permission::READ_ACP)?;
-    push_grants(grant_write_acp, Permission::WRITE_ACP)?;
-    push_grants(grant_full_control, Permission::FULL_CONTROL)?;
-
-    if grants.is_empty() {
-        return Ok(None);
-    }
-
-    grants.push(StoredGrant {
-        grantee: StoredGrantee {
-            grantee_type: "CanonicalUser".to_string(),
-            id: Some(owner.id.clone()),
-            display_name: Some(owner.display_name.clone()),
-            uri: None,
-            email_address: None,
-        },
-        permission: Permission::FULL_CONTROL.to_string(),
-    });
-
-    Ok(Some(StoredAcl {
-        owner: owner.clone(),
-        grants,
-    }))
 }
 
 #[derive(Debug, Clone)]
@@ -586,7 +98,7 @@ impl AsyncSeek for InMemoryAsyncReader {
 
 impl FS {
     pub fn new() -> Self {
-        // let store: ECStore = ECStore::new(address, endpoint_pools).await?;
+        rustfs_s3_common::init_s3_metrics();
         Self {}
     }
 
@@ -657,13 +169,6 @@ impl FS {
             None => Ok((None, None)),
         }
     }
-}
-
-pub(crate) const ACL_GROUP_ALL_USERS: &str = "http://acs.amazonaws.com/groups/global/AllUsers";
-pub(crate) const ACL_GROUP_AUTHENTICATED_USERS: &str = "http://acs.amazonaws.com/groups/global/AuthenticatedUsers";
-
-pub(crate) fn is_public_canned_acl(acl: &str) -> bool {
-    matches!(acl, "public-read" | "public-read-write" | "authenticated-read")
 }
 
 pub(crate) fn parse_object_version_id(version_id: Option<String>) -> S3Result<Option<Uuid>> {
@@ -812,12 +317,14 @@ impl S3 for FS {
     }
 
     async fn get_bucket_acl(&self, req: S3Request<GetBucketAclInput>) -> S3Result<S3Response<GetBucketAclOutput>> {
+        record_s3_op(S3Operation::GetBucketAcl, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_get_bucket_acl(req).await
     }
 
     #[instrument(level = "debug", skip(self))]
     async fn get_bucket_cors(&self, req: S3Request<GetBucketCorsInput>) -> S3Result<S3Response<GetBucketCorsOutput>> {
+        record_s3_op(S3Operation::GetBucketCors, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_get_bucket_cors(req).await
     }
@@ -826,6 +333,7 @@ impl S3 for FS {
         &self,
         req: S3Request<GetBucketEncryptionInput>,
     ) -> S3Result<S3Response<GetBucketEncryptionOutput>> {
+        record_s3_op(S3Operation::GetBucketEncryption, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_get_bucket_encryption(req).await
     }
@@ -835,6 +343,7 @@ impl S3 for FS {
         &self,
         req: S3Request<GetBucketLifecycleConfigurationInput>,
     ) -> S3Result<S3Response<GetBucketLifecycleConfigurationOutput>> {
+        record_s3_op(S3Operation::GetBucketLifecycleConfiguration, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_get_bucket_lifecycle_configuration(req).await
     }
@@ -842,6 +351,7 @@ impl S3 for FS {
     /// Get bucket location
     #[instrument(level = "debug", skip(self, req))]
     async fn get_bucket_location(&self, req: S3Request<GetBucketLocationInput>) -> S3Result<S3Response<GetBucketLocationOutput>> {
+        record_s3_op(S3Operation::GetBucketLocation, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_get_bucket_location(req).await
     }
@@ -850,11 +360,13 @@ impl S3 for FS {
         &self,
         req: S3Request<GetBucketNotificationConfigurationInput>,
     ) -> S3Result<S3Response<GetBucketNotificationConfigurationOutput>> {
+        record_s3_op(S3Operation::GetBucketNotificationConfiguration, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_get_bucket_notification_configuration(req).await
     }
 
     async fn get_bucket_policy(&self, req: S3Request<GetBucketPolicyInput>) -> S3Result<S3Response<GetBucketPolicyOutput>> {
+        record_s3_op(S3Operation::GetBucketPolicy, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_get_bucket_policy(req).await
     }
@@ -863,6 +375,7 @@ impl S3 for FS {
         &self,
         req: S3Request<GetBucketPolicyStatusInput>,
     ) -> S3Result<S3Response<GetBucketPolicyStatusOutput>> {
+        record_s3_op(S3Operation::GetBucketPolicyStatus, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_get_bucket_policy_status(req).await
     }
@@ -871,12 +384,14 @@ impl S3 for FS {
         &self,
         req: S3Request<GetBucketReplicationInput>,
     ) -> S3Result<S3Response<GetBucketReplicationOutput>> {
+        record_s3_op(S3Operation::GetBucketReplication, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_get_bucket_replication(req).await
     }
 
     #[instrument(level = "debug", skip(self))]
     async fn get_bucket_tagging(&self, req: S3Request<GetBucketTaggingInput>) -> S3Result<S3Response<GetBucketTaggingOutput>> {
+        record_s3_op(S3Operation::GetBucketTagging, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_get_bucket_tagging(req).await
     }
@@ -886,6 +401,7 @@ impl S3 for FS {
         &self,
         req: S3Request<GetPublicAccessBlockInput>,
     ) -> S3Result<S3Response<GetPublicAccessBlockOutput>> {
+        record_s3_op(S3Operation::GetPublicAccessBlock, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_get_public_access_block(req).await
     }
@@ -895,6 +411,7 @@ impl S3 for FS {
         &self,
         req: S3Request<GetBucketVersioningInput>,
     ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
+        record_s3_op(S3Operation::GetBucketVersioning, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_get_bucket_versioning(req).await
     }
@@ -911,6 +428,7 @@ impl S3 for FS {
     }
 
     async fn get_object_acl(&self, req: S3Request<GetObjectAclInput>) -> S3Result<S3Response<GetObjectAclOutput>> {
+        record_s3_op(S3Operation::GetObjectAcl, &req.input.bucket);
         let usecase = DefaultObjectUsecase::from_global();
         usecase.execute_get_object_acl(req).await
     }
@@ -936,6 +454,7 @@ impl S3 for FS {
         &self,
         req: S3Request<GetObjectLockConfigurationInput>,
     ) -> S3Result<S3Response<GetObjectLockConfigurationOutput>> {
+        record_s3_op(S3Operation::GetObjectLockConfiguration, &req.input.bucket);
         let usecase = DefaultObjectUsecase::from_global();
         usecase.execute_get_object_lock_configuration(req).await
     }
@@ -950,15 +469,17 @@ impl S3 for FS {
 
     #[instrument(level = "debug", skip(self))]
     async fn get_object_tagging(&self, req: S3Request<GetObjectTaggingInput>) -> S3Result<S3Response<GetObjectTaggingOutput>> {
+        record_s3_op(S3Operation::GetObjectTagging, &req.input.bucket);
         let usecase = DefaultObjectUsecase::from_global();
         usecase.execute_get_object_tagging(req).await
     }
 
-    #[instrument(level = "debug", skip(self, _req))]
-    async fn get_object_torrent(&self, _req: S3Request<GetObjectTorrentInput>) -> S3Result<S3Response<GetObjectTorrentOutput>> {
+    #[instrument(level = "debug", skip(self, req))]
+    async fn get_object_torrent(&self, req: S3Request<GetObjectTorrentInput>) -> S3Result<S3Response<GetObjectTorrentOutput>> {
         // Torrent functionality is not implemented in RustFS
         // Per S3 API test expectations, return 404 NoSuchKey (not 501 Not Implemented)
         // This allows clients to gracefully handle the absence of torrent support
+        record_s3_op(S3Operation::GetObjectTorrent, &req.input.bucket);
         Err(S3Error::new(S3ErrorCode::NoSuchKey))
     }
 
@@ -976,6 +497,8 @@ impl S3 for FS {
 
     #[instrument(level = "debug", skip(self))]
     async fn list_buckets(&self, req: S3Request<ListBucketsInput>) -> S3Result<S3Response<ListBucketsOutput>> {
+        // List buckets not associated with a bucket, give it bucket label "*" to denote "all".
+        record_s3_op(S3Operation::ListBuckets, "*");
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_list_buckets(req).await
     }
@@ -984,6 +507,7 @@ impl S3 for FS {
         &self,
         req: S3Request<ListMultipartUploadsInput>,
     ) -> S3Result<S3Response<ListMultipartUploadsOutput>> {
+        record_s3_op(S3Operation::ListMultipartUploads, &req.input.bucket);
         let usecase = DefaultMultipartUsecase::from_global();
         usecase.execute_list_multipart_uploads(req).await
     }
@@ -992,24 +516,28 @@ impl S3 for FS {
         &self,
         req: S3Request<ListObjectVersionsInput>,
     ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
+        record_s3_op(S3Operation::ListObjectVersions, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_list_object_versions(req).await
     }
 
     #[instrument(level = "debug", skip(self, req))]
     async fn list_objects(&self, req: S3Request<ListObjectsInput>) -> S3Result<S3Response<ListObjectsOutput>> {
+        record_s3_op(S3Operation::ListObjects, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_list_objects(req).await
     }
 
     #[instrument(level = "debug", skip(self, req))]
     async fn list_objects_v2(&self, req: S3Request<ListObjectsV2Input>) -> S3Result<S3Response<ListObjectsV2Output>> {
+        record_s3_op(S3Operation::ListObjectsV2, &req.input.bucket);
         let usecase = DefaultBucketUsecase::from_global();
         usecase.execute_list_objects_v2(req).await
     }
 
     #[instrument(level = "debug", skip(self, req))]
     async fn list_parts(&self, req: S3Request<ListPartsInput>) -> S3Result<S3Response<ListPartsOutput>> {
+        record_s3_op(S3Operation::ListParts, &req.input.bucket);
         let usecase = DefaultMultipartUsecase::from_global();
         usecase.execute_list_parts(req).await
     }
@@ -1026,6 +554,7 @@ impl S3 for FS {
     }
 
     async fn get_bucket_logging(&self, req: S3Request<GetBucketLoggingInput>) -> S3Result<S3Response<GetBucketLoggingOutput>> {
+        record_s3_op(S3Operation::GetBucketLogging, &req.input.bucket);
         let Some(store) = new_object_layer_fn() else {
             return Err(s3_error!(InternalError, "Not init"));
         };
@@ -1037,6 +566,7 @@ impl S3 for FS {
     }
 
     async fn put_bucket_logging(&self, req: S3Request<PutBucketLoggingInput>) -> S3Result<S3Response<PutBucketLoggingOutput>> {
+        record_s3_op(S3Operation::PutBucketLogging, &req.input.bucket);
         let Some(store) = new_object_layer_fn() else {
             return Err(s3_error!(InternalError, "Not init"));
         };
@@ -1116,6 +646,7 @@ impl S3 for FS {
     }
 
     async fn put_object_acl(&self, req: S3Request<PutObjectAclInput>) -> S3Result<S3Response<PutObjectAclOutput>> {
+        record_s3_op(S3Operation::PutObjectAcl, &req.input.bucket);
         let usecase = DefaultObjectUsecase::from_global();
         usecase.execute_put_object_acl(req).await
     }
@@ -1166,12 +697,14 @@ impl S3 for FS {
 
     #[instrument(level = "debug", skip(self, req))]
     async fn upload_part(&self, req: S3Request<UploadPartInput>) -> S3Result<S3Response<UploadPartOutput>> {
+        record_s3_op(S3Operation::UploadPart, &req.input.bucket);
         let usecase = DefaultMultipartUsecase::from_global();
         usecase.execute_upload_part(req).await
     }
 
     #[instrument(level = "debug", skip(self, req))]
     async fn upload_part_copy(&self, req: S3Request<UploadPartCopyInput>) -> S3Result<S3Response<UploadPartCopyOutput>> {
+        record_s3_op(S3Operation::UploadPartCopy, &req.input.bucket);
         let usecase = DefaultMultipartUsecase::from_global();
         usecase.execute_upload_part_copy(req).await
     }

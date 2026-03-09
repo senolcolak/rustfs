@@ -86,6 +86,7 @@ pub trait ScannerIODisk: Send + Sync + Debug + 'static {
 
 #[async_trait::async_trait]
 impl ScannerIO for ECStore {
+    #[tracing::instrument(skip(self, updates))]
     async fn nsscanner(
         &self,
         ctx: CancellationToken,
@@ -177,17 +178,17 @@ impl ScannerIO for ECStore {
                         let mut all_merged = DataUsageCache::default();
                         for result in results.iter() {
                             if result.info.last_update.is_none() {
-                                return;
+                                continue;
                             }
                             all_merged.merge(result);
                         }
 
-                        if all_merged.root().is_some() && all_merged.info.last_update.unwrap() > last_update
-                           && let Err(e) = updates
-                                .send(all_merged.dui(&all_merged.info.name, &all_buckets_clone))
-                                .await {
+                        if all_merged.root().is_some() && all_merged.info.last_update.unwrap() > last_update {
+                            let dui = all_merged.dui(&all_merged.info.name, &all_buckets_clone);
+                            if let Err(e) = updates.send(dui).await {
                                 error!("Failed to send data usage info: {}", e);
                             }
+                        }
                         break;
                     }
                     _ = ticker.tick() => {
@@ -195,15 +196,14 @@ impl ScannerIO for ECStore {
                         let mut all_merged = DataUsageCache::default();
                         for result in results.iter() {
                             if result.info.last_update.is_none() {
-                                return;
+                                continue;
                             }
                             all_merged.merge(result);
                         }
 
                         if all_merged.root().is_some() && all_merged.info.last_update.unwrap() > last_update {
-                           if let Err(e) = updates
-                                .send(all_merged.dui(&all_merged.info.name, &all_buckets_clone))
-                                .await {
+                            let dui = all_merged.dui(&all_merged.info.name, &all_buckets_clone);
+                            if let Err(e) = updates.send(dui).await {
                                 error!("Failed to send data usage info: {}", e);
                             }
                             last_update = all_merged.info.last_update.unwrap();
@@ -223,6 +223,7 @@ impl ScannerIO for ECStore {
 
 #[async_trait::async_trait]
 impl ScannerIOCache for SetDisks {
+    #[tracing::instrument(skip(self, updates))]
     async fn nsscanner_cache(
         self: Arc<Self>,
         ctx: CancellationToken,
@@ -299,7 +300,7 @@ impl ScannerIOCache for SetDisks {
 
                        let cache = cache_mutex_clone.lock().await;
                        if cache.info.last_update == last_update {
-                           continue;
+                        continue;
                        }
 
                        if let Err(e) = cache.save(store_clone.clone(), DATA_USAGE_CACHE_NAME).await {
@@ -563,6 +564,8 @@ impl ScannerIODisk for Disk {
 
         Ok(size_summary)
     }
+
+    #[tracing::instrument(skip(self, updates, cache))]
     async fn nsscanner_disk(
         &self,
         ctx: CancellationToken,
