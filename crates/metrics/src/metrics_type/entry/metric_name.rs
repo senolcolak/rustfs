@@ -183,6 +183,9 @@ pub enum MetricName {
     ConfigStandardParity,
 
     // Erasure coding set related metrics
+    ErasureSetSize,
+    ErasureSetParity,
+    ErasureSetDataShards,
     ErasureSetOverallWriteQuorum,
     ErasureSetOverallHealth,
     ErasureSetReadQuorum,
@@ -263,6 +266,8 @@ pub enum MetricName {
     ReplicationMaxQueuedCount,
     ReplicationMaxDataTransferRate,
     ReplicationRecentBacklogCount,
+    BandwidthLimitBytesPerSecond,
+    BandwidthCurrentBytesPerSecond,
 
     // Scanner-related metrics
     ScannerBucketScansFinished,
@@ -344,6 +349,22 @@ pub enum MetricName {
     ProcessResidentMemoryBytes,
     ProcessVirtualMemoryBytes,
     ProcessVirtualMemoryMaxBytes,
+
+    // Process-level system monitoring metrics (migrated from rustfs-obs::system)
+    /// Process CPU usage percentage (0-100)
+    ProcessCPUUsage,
+    /// Process CPU utilization percentage (considering multiple cores)
+    ProcessCPUUtilization,
+    /// Process disk I/O bytes
+    ProcessDiskIO,
+    /// Process network I/O bytes
+    ProcessNetworkIO,
+    /// Process network I/O bytes per interface
+    ProcessNetworkIOPerInterface,
+    /// Process status (0: Running, 1: Sleeping, 2: Zombie, 3: Other)
+    ProcessStatus,
+    /// Process GPU memory usage in bytes
+    ProcessGpuMemoryUsage,
 
     // Custom metrics
     Custom(String),
@@ -500,6 +521,9 @@ impl MetricName {
             Self::ConfigStandardParity => "standard_parity".to_string(),
 
             // Erasure coding set related metrics
+            Self::ErasureSetSize => "size".to_string(),
+            Self::ErasureSetParity => "parity".to_string(),
+            Self::ErasureSetDataShards => "data_shards".to_string(),
             Self::ErasureSetOverallWriteQuorum => "overall_write_quorum".to_string(),
             Self::ErasureSetOverallHealth => "overall_health".to_string(),
             Self::ErasureSetReadQuorum => "read_quorum".to_string(),
@@ -580,6 +604,8 @@ impl MetricName {
             Self::ReplicationMaxQueuedCount => "max_queued_count".to_string(),
             Self::ReplicationMaxDataTransferRate => "max_data_transfer_rate".to_string(),
             Self::ReplicationRecentBacklogCount => "recent_backlog_count".to_string(),
+            Self::BandwidthLimitBytesPerSecond => "bandwidth_limit_bytes_per_second".to_string(),
+            Self::BandwidthCurrentBytesPerSecond => "bandwidth_current_bytes_per_second".to_string(),
 
             // Scanner-related metrics
             Self::ScannerBucketScansFinished => "bucket_scans_finished".to_string(),
@@ -661,6 +687,15 @@ impl MetricName {
             Self::ProcessResidentMemoryBytes => "resident_memory_bytes".to_string(),
             Self::ProcessVirtualMemoryBytes => "virtual_memory_bytes".to_string(),
             Self::ProcessVirtualMemoryMaxBytes => "virtual_memory_max_bytes".to_string(),
+
+            // Process-level system monitoring metrics (migrated from rustfs-obs::system)
+            Self::ProcessCPUUsage => "cpu_usage".to_string(),
+            Self::ProcessCPUUtilization => "cpu_utilization".to_string(),
+            Self::ProcessDiskIO => "disk_io".to_string(),
+            Self::ProcessNetworkIO => "network_io".to_string(),
+            Self::ProcessNetworkIOPerInterface => "network_io_per_interface".to_string(),
+            Self::ProcessGpuMemoryUsage => "gpu_memory_usage".to_string(),
+            Self::ProcessStatus => "status".to_string(),
 
             Self::Custom(name) => name.clone(),
         }

@@ -14,10 +14,14 @@
 
 use crate::storage::{process_lambda_configurations, process_queue_configurations, process_topic_configurations};
 use crate::{admin, config, version};
-use rustfs_config::{DEFAULT_UPDATE_CHECK, ENV_UPDATE_CHECK, RUSTFS_REGION};
+use rustfs_config::{
+    DEFAULT_BUFFER_MAX_SIZE, DEFAULT_BUFFER_MIN_SIZE, DEFAULT_BUFFER_PROFILE, DEFAULT_BUFFER_UNKNOWN_SIZE, DEFAULT_UPDATE_CHECK,
+    ENV_RUSTFS_BUFFER_DEFAULT_SIZE, ENV_RUSTFS_BUFFER_MAX_SIZE, ENV_RUSTFS_BUFFER_MIN_SIZE, ENV_UPDATE_CHECK, RUSTFS_REGION,
+};
 use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_notify::notifier_global;
 use rustfs_targets::arn::{ARN, TargetIDError};
+use rustfs_utils::get_env_usize;
 use s3s::s3_error;
 use std::env;
 use std::io::Error;
@@ -297,10 +301,9 @@ pub(crate) async fn init_kms_system(config: &config::Config) -> std::io::Result<
 /// # Arguments
 /// * `config` - The application configuration options
 pub(crate) fn init_buffer_profile_system(config: &config::Config) {
-    use crate::config::workload_profiles::{
-        RustFSBufferConfig, WorkloadProfile, init_global_buffer_config, set_buffer_profile_enabled,
-    };
+    use crate::config::{RustFSBufferConfig, WorkloadProfile, init_global_buffer_config, set_buffer_profile_enabled};
 
+    // Whether buffer profiling is disabled or not, it is enabled by default, unless the user explicitly sets '--buffer-profile-disable' or 'RUSTFS_BUFFER_PROFILE_DISABLE=true'
     if config.buffer_profile_disable {
         // User explicitly disabled buffer profiling - use GeneralPurpose profile in disabled mode
         info!("Buffer profiling disabled via --buffer-profile-disable, using GeneralPurpose profile");
@@ -310,13 +313,59 @@ pub(crate) fn init_buffer_profile_system(config: &config::Config) {
         info!("Buffer profiling enabled with profile: {}", config.buffer_profile);
 
         // Parse the workload profile from configuration string
-        let profile = WorkloadProfile::from_name(&config.buffer_profile);
+        // Support a custom profile when buffer_profile is set to "custom";
+        // its sizes are controlled via RUSTFS_BUFFER_MIN_SIZE, RUSTFS_BUFFER_MAX_SIZE,
+        // and RUSTFS_BUFFER_DEFAULT_SIZE environment variables.
+        let profile = if config.buffer_profile.eq_ignore_ascii_case("custom") {
+            // Try to create custom profile from environment variables
+            let min_size = get_env_usize(ENV_RUSTFS_BUFFER_MIN_SIZE, DEFAULT_BUFFER_MIN_SIZE);
+            let max_size = get_env_usize(ENV_RUSTFS_BUFFER_MAX_SIZE, DEFAULT_BUFFER_MAX_SIZE);
+            let default_unknown = get_env_usize(ENV_RUSTFS_BUFFER_DEFAULT_SIZE, DEFAULT_BUFFER_UNKNOWN_SIZE);
+
+            info!(
+                "Creating custom buffer profile: min={}, max={}, default={}",
+                min_size, max_size, default_unknown
+            );
+            WorkloadProfile::custom(
+                min_size,
+                max_size,
+                default_unknown,
+                vec![
+                    (1024 * 1024, 64 * 1024),        // < 1MB: 64KB
+                    (100 * 1024 * 1024, 256 * 1024), // 1MB-100MB: 256KB
+                    (i64::MAX, 1024 * 1024),         // >= 100MB: 1MB
+                ],
+            )
+        } else {
+            WorkloadProfile::from_name(&config.buffer_profile)
+        };
 
         // Log the selected profile for operational visibility
         info!("Active buffer profile: {:?}", profile);
 
+        // Create and validate buffer configuration
+        let mut buffer_config = RustFSBufferConfig::new(profile);
+        if let Err(e) = buffer_config.validate() {
+            warn!("Buffer configuration validation failed: {}. Falling back to GeneralPurpose profile.", e);
+            // Fall back to a known-good profile to avoid installing an invalid configuration
+            let fallback_profile = WorkloadProfile::from_name(DEFAULT_BUFFER_PROFILE);
+            info!("Using fallback buffer profile: {:?}", fallback_profile);
+            let fallback_config = RustFSBufferConfig::new(fallback_profile);
+            if let Err(e2) = fallback_config.validate() {
+                error!(
+                    "Fallback buffer configuration validation failed: {}. Aborting buffer profiling initialization.",
+                    e2
+                );
+                panic!("Failed to initialize a valid RustFS buffer configuration");
+            }
+            buffer_config = fallback_config;
+        }
+
+        // Log the workload profile name
+        info!("Workload profile: {}", buffer_config.workload_name());
+
         // Initialize the global buffer configuration
-        init_global_buffer_config(RustFSBufferConfig::new(profile));
+        init_global_buffer_config(buffer_config);
 
         // Enable buffer profiling globally
         set_buffer_profile_enabled(true);
@@ -505,6 +554,76 @@ pub async fn init_ftps_system() -> Result<Option<tokio::sync::broadcast::Sender<
         });
 
         info!("FTPS system initialized successfully");
+        Ok(Some(shutdown_tx))
+    }
+}
+
+/// Initialize the WebDAV system
+///
+/// This function initializes the WebDAV server if enabled in the configuration.
+/// It sets up the WebDAV server with the appropriate configuration and starts
+/// the server in a background task.
+#[cfg(feature = "webdav")]
+#[instrument(skip_all)]
+pub async fn init_webdav_system() -> Result<Option<tokio::sync::broadcast::Sender<()>>, Box<dyn std::error::Error + Send + Sync>>
+{
+    {
+        use crate::protocols::ProtocolStorageClient;
+        use rustfs_config::{
+            DEFAULT_WEBDAV_ADDRESS, ENV_WEBDAV_ADDRESS, ENV_WEBDAV_CA_FILE, ENV_WEBDAV_CERTS_DIR, ENV_WEBDAV_ENABLE,
+            ENV_WEBDAV_MAX_BODY_SIZE, ENV_WEBDAV_REQUEST_TIMEOUT, ENV_WEBDAV_TLS_ENABLED,
+        };
+        use rustfs_protocols::{WebDavConfig, WebDavServer};
+
+        // Check if WebDAV is enabled
+        let webdav_enable = rustfs_utils::get_env_bool(ENV_WEBDAV_ENABLE, false);
+        if !webdav_enable {
+            debug!("WebDAV system is disabled");
+            return Ok(None);
+        }
+
+        // Parse WebDAV address
+        let webdav_address_str = rustfs_utils::get_env_str(ENV_WEBDAV_ADDRESS, DEFAULT_WEBDAV_ADDRESS);
+        let addr = rustfs_utils::net::parse_and_resolve_address(&webdav_address_str)
+            .map_err(|e| format!("Invalid WebDAV address '{webdav_address_str}': {e}"))?;
+
+        // Get WebDAV configuration from environment variables
+        let tls_enabled = rustfs_utils::get_env_bool(ENV_WEBDAV_TLS_ENABLED, true);
+        let cert_dir = rustfs_utils::get_env_opt_str(ENV_WEBDAV_CERTS_DIR);
+        let ca_file = rustfs_utils::get_env_opt_str(ENV_WEBDAV_CA_FILE);
+        let max_body_size = rustfs_utils::get_env_u64(ENV_WEBDAV_MAX_BODY_SIZE, WebDavConfig::DEFAULT_MAX_BODY_SIZE);
+        let request_timeout_secs =
+            rustfs_utils::get_env_u64(ENV_WEBDAV_REQUEST_TIMEOUT, WebDavConfig::DEFAULT_REQUEST_TIMEOUT_SECS);
+
+        // Create WebDAV configuration
+        let config = WebDavConfig {
+            bind_addr: addr,
+            tls_enabled,
+            cert_dir,
+            ca_file,
+            max_body_size,
+            request_timeout_secs,
+        };
+
+        // Create WebDAV server with protocol storage client
+        let fs = crate::storage::ecfs::FS::new();
+        let storage_client = ProtocolStorageClient::new(fs);
+        let server: WebDavServer<crate::protocols::ProtocolStorageClient> = WebDavServer::new(config, storage_client).await?;
+
+        // Log server configuration
+        info!("WebDAV server configured on {}", server.config().bind_addr);
+
+        // Start WebDAV server in background task with proper shutdown support
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+
+        tokio::spawn(async move {
+            if let Err(e) = server.start(shutdown_rx).await {
+                error!("WebDAV server error: {}", e);
+            }
+            info!("WebDAV server shutdown completed");
+        });
+
+        info!("WebDAV system initialized successfully");
         Ok(Some(shutdown_tx))
     }
 }

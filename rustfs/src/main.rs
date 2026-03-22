@@ -21,7 +21,7 @@ mod error;
 mod init;
 mod license;
 mod profiling;
-#[cfg(feature = "ftps")]
+#[cfg(any(feature = "ftps", feature = "webdav"))]
 mod protocols;
 mod server;
 mod storage;
@@ -38,16 +38,20 @@ use crate::init::{
 #[cfg(feature = "ftps")]
 use crate::init::{init_ftp_system, init_ftps_system};
 
+#[cfg(feature = "webdav")]
+use crate::init::init_webdav_system;
+
 use crate::server::{
     SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, init_cert, init_event_notifier, shutdown_event_notifier,
     start_audit_system, start_http_server, stop_audit_system, wait_for_shutdown,
 };
-use license::init_license;
+use license::{current_license, init_license, license_status};
 use rustfs_common::{GlobalReadiness, SystemStage, set_global_addr};
 use rustfs_credentials::init_global_action_credentials;
 use rustfs_ecstore::store::init_lock_clients;
 use rustfs_ecstore::{
     bucket::metadata_sys::init_bucket_metadata_sys,
+    bucket::migration::{try_migrate_bucket_metadata, try_migrate_iam_config},
     bucket::replication::{get_global_replication_pool, init_background_replication},
     config as ecconfig,
     endpoints::EndpointServerPools,
@@ -67,7 +71,10 @@ use rustfs_iam::{init_iam_sys, init_oidc_sys};
 use rustfs_metrics::init_metrics_system;
 use rustfs_obs::{init_obs, set_global_guard};
 use rustfs_scanner::init_data_scanner;
-use rustfs_utils::{get_env_bool_with_aliases, net::parse_and_resolve_address};
+use rustfs_utils::{
+    ExternalEnvCompatReport, apply_external_env_compat, get_env_bool_with_aliases, net::parse_and_resolve_address,
+};
+use rustls::crypto::aws_lc_rs::default_provider;
 use std::io::{Error, Result};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -95,6 +102,10 @@ static GLOBAL: profiling::allocator::TracingAllocator<mimalloc::MiMalloc> =
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() {
+    if let Err(err) = bootstrap_external_prefix_compat() {
+        eprintln!("[WARN] Failed to bootstrap external-prefix compatibility: {err}");
+    }
+
     let runtime = server::tokio_runtime_builder()
         .build()
         .expect("Failed to build Tokio runtime");
@@ -105,9 +116,66 @@ fn main() {
         std::process::exit(1);
     }
 }
+
+fn bootstrap_external_prefix_compat() -> Result<()> {
+    let env_compat_report = apply_external_env_compat();
+    if env_compat_report.conflict_count() > 0 {
+        // RUSTFS_* is the canonical namespace in this codebase, so on key conflicts we keep RUSTFS_*
+        // to preserve explicit user/operator overrides and avoid changing existing runtime behavior.
+        eprintln!(
+            "[WARN] Found {} source/RUSTFS_ conflict(s), keeping RUSTFS_ values: {}",
+            env_compat_report.conflict_count(),
+            env_compat_report.conflict_keys.join(", ")
+        );
+    }
+
+    if env_compat_report.mapped_count() == 0 {
+        return Ok(());
+    }
+
+    eprintln!(
+        "[INFO] Applying external-prefix compatibility in-process for {} variable(s): {}",
+        env_compat_report.mapped_count(),
+        format_external_prefix_mappings(&env_compat_report)
+    );
+
+    Ok(())
+}
+
+fn format_external_prefix_mappings(report: &ExternalEnvCompatReport) -> String {
+    report
+        .mapped_pairs
+        .iter()
+        .map(|(source_key, rustfs_key)| format!("{source_key}->{rustfs_key}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 async fn async_main() -> Result<()> {
-    // Parse the obtained parameters
-    let config = config::Config::parse()?;
+    // Parse command line arguments
+    let args: Vec<String> = std::env::args().collect();
+    let command_result = match config::Opt::parse_command(args) {
+        Ok(result) => result,
+        Err(e) => {
+            eprintln!("Command parse failed, error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // Handle info command
+    if let config::CommandResult::Info(opts) = command_result {
+        config::execute_info(&opts);
+        return Ok(());
+    }
+
+    // Get config for server command
+    let config = match command_result {
+        config::CommandResult::Server(cfg) => cfg,
+        config::CommandResult::Info(_) => unreachable!(),
+    };
+
+    // Initialize the global config snapshot for info command
+    config::init_config_snapshot(&config);
 
     // Initialize the configuration
     init_license(config.license.clone());
@@ -133,6 +201,11 @@ async fn async_main() -> Result<()> {
         }
     }
 
+    info!("license status: {}", license_status());
+    if let Some(token) = current_license() {
+        info!("runtime license loaded: {}", token.name);
+    }
+
     // print startup logo
     info!("{}", server::LOGO);
 
@@ -142,6 +215,11 @@ async fn async_main() -> Result<()> {
     // Initialize trusted proxies system
     rustfs_trusted_proxies::init();
 
+    // Make sure to use a modern encryption suite
+    if default_provider().install_default().is_err() {
+        // A crypto provider is already installed (e.g. by the host process); this is fine.
+        debug!("rustls crypto provider already installed, skipping aws-lc-rs default install");
+    }
     // Initialize TLS if a certificate path is provided
     if let Some(tls_path) = &config.tls_path {
         match init_cert(tls_path).await {
@@ -156,7 +234,7 @@ async fn async_main() -> Result<()> {
     }
 
     // Run parameters
-    match run(config).await {
+    match run(*config).await {
         Ok(_) => Ok(()),
         Err(e) => {
             error!("Server encountered an error and is shutting down: {}", e);
@@ -285,6 +363,7 @@ async fn run(config: config::Config) -> Result<()> {
         })?;
 
     ecconfig::init();
+    ecconfig::try_migrate_server_config(store.clone()).await;
 
     // // Initialize global configuration system
     let mut retry_count = 0;
@@ -343,6 +422,26 @@ async fn run(config: config::Config) -> Result<()> {
     #[cfg(not(feature = "ftps"))]
     let ftps_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>> = None;
 
+    // Initialize WebDAV system if enabled
+    #[cfg(feature = "webdav")]
+    let webdav_shutdown_tx = match init_webdav_system().await {
+        Ok(Some(tx)) => {
+            info!("WebDAV system initialized successfully");
+            Some(tx)
+        }
+        Ok(None) => {
+            info!("WebDAV system disabled");
+            None
+        }
+        Err(e) => {
+            error!("Failed to initialize WebDAV system: {}", e);
+            return Err(Error::other(e));
+        }
+    };
+
+    #[cfg(not(feature = "webdav"))]
+    let webdav_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>> = None;
+
     // Initialize buffer profiling system
     init_buffer_profile_system(&config);
 
@@ -365,10 +464,13 @@ async fn run(config: config::Config) -> Result<()> {
     // Collect bucket names into a vector
     let buckets: Vec<String> = buckets_list.into_iter().map(|v| v.name).collect();
 
+    try_migrate_bucket_metadata(store.clone()).await;
+
     if let Some(pool) = get_global_replication_pool() {
         pool.init_resync(ctx.clone(), buckets.clone()).await?;
     }
 
+    try_migrate_iam_config(store.clone()).await;
     init_bucket_metadata_sys(store.clone(), buckets.clone()).await;
 
     // 3. Initialize IAM System (Blocking load)
@@ -466,6 +568,7 @@ async fn run(config: config::Config) -> Result<()> {
                 console_shutdown_tx,
                 ftp_shutdown_tx,
                 ftps_shutdown_tx,
+                webdav_shutdown_tx,
                 ctx.clone(),
             )
             .await;
@@ -478,6 +581,7 @@ async fn run(config: config::Config) -> Result<()> {
                 console_shutdown_tx,
                 ftp_shutdown_tx,
                 ftps_shutdown_tx,
+                webdav_shutdown_tx,
                 ctx.clone(),
             )
             .await;
@@ -495,6 +599,7 @@ async fn handle_shutdown(
     console_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
     ftp_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
     ftps_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
+    webdav_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
     ctx: CancellationToken,
 ) {
     ctx.cancel();
@@ -547,6 +652,15 @@ async fn handle_shutdown(
         let _ = ftps_shutdown_tx.send(());
     }
 
+    // Shutdown WebDAV server
+    if let Some(webdav_shutdown_tx) = webdav_shutdown_tx {
+        info!(
+            target: "rustfs::main::handle_shutdown",
+            "Shutting down WebDAV server..."
+        );
+        let _ = webdav_shutdown_tx.send(());
+    }
+
     // Stop the notification system
     info!(
         target: "rustfs::main::handle_shutdown",
@@ -588,4 +702,30 @@ async fn handle_shutdown(
     // the last updated status is stopped
     state_manager.update(ServiceState::Stopped);
     info!(target: "rustfs::main::handle_shutdown", "Server stopped successfully.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_external_prefix_mappings_lists_mapped_pairs() {
+        let report = ExternalEnvCompatReport {
+            mapped_pairs: vec![
+                ("MINIO_ROOT_USER".to_string(), "RUSTFS_ROOT_USER".to_string()),
+                (
+                    "MINIO_NOTIFY_WEBHOOK_ENABLE_PRIMARY".to_string(),
+                    "RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARY".to_string(),
+                ),
+            ],
+            conflict_keys: Vec::new(),
+        };
+
+        let formatted = format_external_prefix_mappings(&report);
+
+        assert_eq!(
+            formatted,
+            "MINIO_ROOT_USER->RUSTFS_ROOT_USER, MINIO_NOTIFY_WEBHOOK_ENABLE_PRIMARY->RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARY"
+        );
+    }
 }

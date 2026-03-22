@@ -39,6 +39,7 @@ pub async fn create_bitrot_reader(
     length: usize,
     shard_size: usize,
     checksum_algo: HashAlgorithm,
+    skip_verify: bool,
 ) -> disk::error::Result<Option<BitrotReader<Box<dyn AsyncRead + Send + Sync + Unpin>>>> {
     // Calculate the total length to read, including the checksum overhead
     let length = length.div_ceil(shard_size) * checksum_algo.size() + length;
@@ -47,13 +48,18 @@ pub async fn create_bitrot_reader(
         // Use inline data
         let mut rd = Cursor::new(data.to_vec());
         rd.set_position(offset as u64);
-        let reader = BitrotReader::new(Box::new(rd) as Box<dyn AsyncRead + Send + Sync + Unpin>, shard_size, checksum_algo);
+        let reader = BitrotReader::new(
+            Box::new(rd) as Box<dyn AsyncRead + Send + Sync + Unpin>,
+            shard_size,
+            checksum_algo,
+            skip_verify,
+        );
         Ok(Some(reader))
     } else if let Some(disk) = disk {
         // Read from disk
         match disk.read_file_stream(bucket, path, offset, length - offset).await {
             Ok(rd) => {
-                let reader = BitrotReader::new(rd, shard_size, checksum_algo);
+                let reader = BitrotReader::new(rd, shard_size, checksum_algo, skip_verify);
                 Ok(Some(reader))
             }
             Err(e) => Err(e),
@@ -113,10 +119,10 @@ mod tests {
     async fn test_create_bitrot_reader_with_inline_data() {
         let test_data = b"hello world test data";
         let shard_size = 16;
-        let checksum_algo = HashAlgorithm::HighwayHash256;
+        let checksum_algo = HashAlgorithm::HighwayHash256S;
 
         let result =
-            create_bitrot_reader(Some(test_data), None, "test-bucket", "test-path", 0, 0, shard_size, checksum_algo).await;
+            create_bitrot_reader(Some(test_data), None, "test-bucket", "test-path", 0, 0, shard_size, checksum_algo, false).await;
 
         assert!(result.is_ok());
         assert!(result.unwrap().is_some());
@@ -125,9 +131,10 @@ mod tests {
     #[tokio::test]
     async fn test_create_bitrot_reader_without_data_or_disk() {
         let shard_size = 16;
-        let checksum_algo = HashAlgorithm::HighwayHash256;
+        let checksum_algo = HashAlgorithm::HighwayHash256S;
 
-        let result = create_bitrot_reader(None, None, "test-bucket", "test-path", 0, 1024, shard_size, checksum_algo).await;
+        let result =
+            create_bitrot_reader(None, None, "test-bucket", "test-path", 0, 1024, shard_size, checksum_algo, false).await;
 
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
@@ -144,7 +151,7 @@ mod tests {
             "test-path",
             1024, // length
             1024, // shard_size
-            HashAlgorithm::HighwayHash256,
+            HashAlgorithm::HighwayHash256S,
         )
         .await;
 
@@ -176,7 +183,7 @@ mod tests {
             "test-path",
             1024, // length
             1024, // shard_size
-            HashAlgorithm::HighwayHash256,
+            HashAlgorithm::HighwayHash256S,
         )
         .await;
 

@@ -21,7 +21,7 @@ use crate::server::{
     ReadinessGateLayer, RemoteAddr, ServiceState, ServiceStateManager,
     compress::{CompressionConfig, CompressionPredicate},
     hybrid::hybrid,
-    layer::{ConditionalCorsLayer, ObjectAttributesEtagFixLayer, RedirectLayer},
+    layer::{AdminChunkedContentLengthCompatLayer, ConditionalCorsLayer, ObjectAttributesEtagFixLayer, RedirectLayer},
 };
 use crate::storage;
 use crate::storage::tonic_service::make_server;
@@ -35,6 +35,7 @@ use hyper_util::{
 };
 use metrics::{counter, histogram};
 use opentelemetry::global;
+use opentelemetry::trace::TraceContextExt;
 use rustfs_common::GlobalReadiness;
 use rustfs_config::{RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use rustfs_ecstore::rpc::{TONIC_RPC_PREFIX, verify_rpc_signature};
@@ -634,6 +635,7 @@ fn process_connection(
                 None
             })
             .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
+            .layer(AdminChunkedContentLengthCompatLayer)
             .layer(CatchPanicLayer::new())
             // CRITICAL: Insert ReadinessGateLayer before business logic
             // This stops requests from hitting IAMAuth or Storage if they are not ready.
@@ -648,7 +650,7 @@ fn process_connection(
             .layer(
                 TraceLayer::new_for_http()
                     .make_span_with(|request: &HttpRequest<_>| {
-                        let trace_id = request
+                        let request_id = request
                             .headers()
                             .get(http::header::HeaderName::from_static("x-request-id"))
                             .and_then(|v| v.to_str().ok())
@@ -658,6 +660,18 @@ fn process_connection(
                             propagator.extract(&HeaderMapCarrier::new(request.headers()))
                         });
 
+                        // Log trace context extraction for debugging distributed tracing
+                        if parent_context.has_active_span() {
+                            let span_ref = parent_context.span();
+                            debug!(
+                                otel_trace_id = %span_ref.span_context().trace_id(),
+                                otel_parent_span_id = %span_ref.span_context().span_id(),
+                                sampled = span_ref.span_context().is_sampled(),
+                                "Extracted trace context from incoming request headers"
+                            );
+                        } else {
+                            debug!("No trace context found in request headers, will create root span");
+                        }
                         // Extract real client IP from trusted proxy middleware if available
                         let client_info = request.extensions().get::<ClientInfo>();
                         let real_ip = client_info
@@ -665,7 +679,7 @@ fn process_connection(
                             .unwrap_or_else(|| "unknown".to_string());
 
                         let span = tracing::info_span!("http-request",
-                            trace_id = %trace_id,
+                            request_id = %request_id,
                             status_code = tracing::field::Empty,
                             method = %request.method(),
                             real_ip = %real_ip,

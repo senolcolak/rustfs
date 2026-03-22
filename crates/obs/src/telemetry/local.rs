@@ -25,18 +25,27 @@
 //!
 //! The function [`init_local_logging`] is the single entry point for both
 //! cases; callers do **not** need to distinguish between stdout and file modes.
+//!
+//! The file-backed mode delegates retention and compression to
+//! [`crate::cleaner`], which keeps the logging setup code focused on subscriber
+//! construction while still allowing periodic housekeeping in the background.
 
+use super::guard::OtelGuard;
 use crate::TelemetryError;
 use crate::cleaner::LogCleaner;
-use crate::cleaner::types::FileMatchMode;
+use crate::cleaner::types::{CompressionAlgorithm, FileMatchMode};
 use crate::config::OtelConfig;
-use crate::global::OBSERVABILITY_METRIC_ENABLED;
+use crate::global::{METRIC_LOG_CLEANER_RUN_FAILURES_TOTAL, METRIC_LOG_CLEANER_RUNS_TOTAL, set_observability_metric_enabled};
 use crate::telemetry::filter::build_env_filter;
+use crate::telemetry::rolling::{RollingAppender, Rotation};
 use metrics::counter;
 use rustfs_config::observability::{
     DEFAULT_OBS_LOG_CLEANUP_INTERVAL_SECONDS, DEFAULT_OBS_LOG_COMPRESS_OLD_FILES, DEFAULT_OBS_LOG_COMPRESSED_FILE_RETENTION_DAYS,
-    DEFAULT_OBS_LOG_DELETE_EMPTY_FILES, DEFAULT_OBS_LOG_DRY_RUN, DEFAULT_OBS_LOG_GZIP_COMPRESSION_LEVEL,
-    DEFAULT_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES, DEFAULT_OBS_LOG_MAX_TOTAL_SIZE_BYTES, DEFAULT_OBS_LOG_MIN_FILE_AGE_SECONDS,
+    DEFAULT_OBS_LOG_COMPRESSION_ALGORITHM, DEFAULT_OBS_LOG_DELETE_EMPTY_FILES, DEFAULT_OBS_LOG_DRY_RUN,
+    DEFAULT_OBS_LOG_GZIP_COMPRESSION_LEVEL, DEFAULT_OBS_LOG_MATCH_MODE, DEFAULT_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES,
+    DEFAULT_OBS_LOG_MAX_TOTAL_SIZE_BYTES, DEFAULT_OBS_LOG_MIN_FILE_AGE_SECONDS, DEFAULT_OBS_LOG_PARALLEL_COMPRESS,
+    DEFAULT_OBS_LOG_PARALLEL_WORKERS, DEFAULT_OBS_LOG_ZSTD_COMPRESSION_LEVEL, DEFAULT_OBS_LOG_ZSTD_FALLBACK_TO_GZIP,
+    DEFAULT_OBS_LOG_ZSTD_WORKERS,
 };
 use rustfs_config::{APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_ROTATION_TIME, DEFAULT_OBS_LOG_STDOUT_ENABLED};
 use std::sync::Arc;
@@ -48,8 +57,6 @@ use tracing_subscriber::{
     layer::SubscriberExt,
     util::SubscriberInitExt,
 };
-
-use super::guard::OtelGuard;
 
 /// Initialize local logging (stdout-only or file-rolling).
 ///
@@ -89,7 +96,14 @@ pub(super) fn init_local_logging(
     let log_dir_str = config.log_directory.as_deref().filter(|s| !s.is_empty());
 
     if let Some(log_directory) = log_dir_str {
-        init_file_logging_internal(config, log_directory, logger_level, is_production)
+        match init_file_logging_internal(config, log_directory, logger_level, is_production) {
+            Ok(guard) => Ok(guard),
+            Err(error) if should_fallback_to_stdout(&error) => {
+                emit_file_logging_fallback_warning(log_directory, &error);
+                Ok(init_stdout_only(config, logger_level, is_production))
+            }
+            Err(error) => Err(error),
+        }
     } else {
         Ok(init_stdout_only(config, logger_level, is_production))
     }
@@ -111,6 +125,8 @@ fn init_stdout_only(_config: &OtelConfig, logger_level: &str, is_production: boo
     let env_filter = build_env_filter(logger_level, None);
     let (nb, guard) = tracing_appender::non_blocking(std::io::stdout());
 
+    // Keep stdout formatting JSON-shaped even in local-only mode so operators
+    // can ship the same log schema to external collectors if needed.
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_timer(LocalTime::rfc_3339())
         .with_target(true)
@@ -131,7 +147,7 @@ fn init_stdout_only(_config: &OtelConfig, logger_level: &str, is_production: boo
         .with(fmt_layer)
         .init();
 
-    OBSERVABILITY_METRIC_ENABLED.set(false).ok();
+    set_observability_metric_enabled(false);
     counter!("rustfs.start.total").increment(1);
     info!("Init stdout logging (level: {})", logger_level);
 
@@ -154,6 +170,10 @@ fn init_stdout_only(_config: &OtelConfig, logger_level: &str, is_production: boo
 /// Called by [`init_local_logging`] when a log directory is present.
 /// Handles directory creation, permission enforcement (Unix), file appender
 /// setup, optional stdout mirror, and log-cleanup task spawning.
+///
+/// The function intentionally performs all fallible filesystem preparation
+/// before registering the subscriber so startup failures are reported early and
+/// do not leave partially initialized tracing state behind.
 fn init_file_logging_internal(
     config: &OtelConfig,
     log_directory: &str,
@@ -175,39 +195,29 @@ fn init_file_logging_internal(
 
     // ── 3. Choose rotation strategy ──────────────────────────────────────────
     // `log_rotation_time` drives the rolling-appender rotation period.
-    let rotation = config
+    let rotation_str = config
         .log_rotation_time
         .as_deref()
         .unwrap_or(DEFAULT_LOG_ROTATION_TIME)
         .to_lowercase();
 
-    // Determine match mode from config, defaulting to Suffix
-    let match_mode = match config.log_match_mode.as_deref().map(|s| s.to_lowercase()).as_deref() {
-        Some("prefix") => FileMatchMode::Prefix,
-        _ => FileMatchMode::Suffix,
+    // Match mode controls how the rolling filename is recognized later by the
+    // cleaner. Suffix mode fits timestamp-prefixed filenames especially well.
+    let match_mode = FileMatchMode::from_config_str(config.log_match_mode.as_deref().unwrap_or(DEFAULT_OBS_LOG_MATCH_MODE));
+
+    let rotation = match rotation_str.as_str() {
+        "minutely" => Rotation::Minutely,
+        "hourly" => Rotation::Hourly,
+        "daily" => Rotation::Daily,
+        _ => Rotation::Daily,
     };
 
-    use tracing_appender::rolling::{RollingFileAppender, Rotation};
-    let file_appender = {
-        let rotation = match rotation.as_str() {
-            "minutely" => Rotation::MINUTELY,
-            "hourly" => Rotation::HOURLY,
-            _ => Rotation::DAILY,
-        };
+    let max_single_file_size = config
+        .log_max_single_file_size_bytes
+        .unwrap_or(DEFAULT_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES);
 
-        let mut builder = RollingFileAppender::builder()
-            .rotation(rotation)
-            .max_log_files(keep_files * 3); // Make sure there are some data files to archive to avoid premature deletion
-
-        match match_mode {
-            FileMatchMode::Prefix => builder = builder.filename_prefix(log_filename),
-            FileMatchMode::Suffix => builder = builder.filename_suffix(log_filename),
-        }
-
-        builder
-            .build(log_directory)
-            .expect("failed to initialize rolling file appender")
-    };
+    let file_appender =
+        RollingAppender::new(log_directory, log_filename.to_string(), rotation, max_single_file_size, match_mode)?;
 
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
@@ -215,7 +225,8 @@ fn init_file_logging_internal(
     let env_filter = build_env_filter(logger_level, None);
     let span_events = if is_production { FmtSpan::CLOSE } else { FmtSpan::FULL };
 
-    // File layer writes JSON without ANSI codes.
+    // File output stays machine-readable and free of ANSI sequences so the
+    // resulting files are safe to parse or ship to log processors.
     let file_layer = tracing_subscriber::fmt::layer()
         .with_timer(LocalTime::rfc_3339())
         .with_target(true)
@@ -231,7 +242,8 @@ fn init_file_logging_internal(
         .with_span_events(span_events.clone());
 
     // Optional stdout mirror: enabled explicitly via `log_stdout_enabled`, or
-    // unconditionally in non-production environments.
+    // unconditionally in non-production environments so developers still see
+    // immediate terminal output while file rotation remains enabled.
     let (stdout_layer, stdout_guard) = if config.log_stdout_enabled.unwrap_or(DEFAULT_OBS_LOG_STDOUT_ENABLED) || !is_production {
         let (stdout_nb, stdout_guard) = tracing_appender::non_blocking(std::io::stdout());
         let enable_color = std::io::stdout().is_terminal();
@@ -263,14 +275,14 @@ fn init_file_logging_internal(
         .with(stdout_layer)
         .init();
 
-    OBSERVABILITY_METRIC_ENABLED.set(false).ok();
+    set_observability_metric_enabled(false);
 
     // ── 5. Start background cleanup task ─────────────────────────────────────
     let cleanup_handle = spawn_cleanup_task(config, log_directory, log_filename, keep_files);
 
     info!(
         "Init file logging at '{}', rotation: {}, keep {} files",
-        log_directory, rotation, keep_files
+        log_directory, rotation_str, keep_files
     );
 
     Ok(OtelGuard {
@@ -292,8 +304,10 @@ fn init_file_logging_internal(
 /// Tightens permissions to `0755` if the directory is more permissive.
 /// This prevents world-writable log directories from being a security hazard.
 /// No-ops if permissions are already `0755` or stricter.
+///
+/// The function never broadens permissions; it is strictly a hardening step.
 #[cfg(unix)]
-fn ensure_dir_permissions(log_directory: &str) -> Result<(), TelemetryError> {
+pub fn ensure_dir_permissions(log_directory: &str) -> Result<(), TelemetryError> {
     use std::fs::Permissions;
     use std::os::unix::fs::PermissionsExt;
 
@@ -324,6 +338,24 @@ fn ensure_dir_permissions(log_directory: &str) -> Result<(), TelemetryError> {
     }
 }
 
+pub(super) fn should_fallback_to_stdout(error: &TelemetryError) -> bool {
+    match error {
+        TelemetryError::SetPermissions(_) => true,
+        TelemetryError::Io(message) => {
+            let message = message.to_ascii_lowercase();
+            message.contains("permission denied") || message.contains("os error 13")
+        }
+        _ => false,
+    }
+}
+
+pub(super) fn emit_file_logging_fallback_warning(log_directory: &str, error: &TelemetryError) {
+    eprintln!(
+        "[WARN] Failed to initialize file observability logging at '{}': {}. Falling back to stdout logging.",
+        log_directory, error
+    );
+}
+
 // ─── Cleanup task ─────────────────────────────────────────────────────────────
 
 /// Spawn a background task that periodically cleans up old log files.
@@ -332,6 +364,10 @@ fn ensure_dir_permissions(log_directory: &str) -> Result<(), TelemetryError> {
 /// sensible defaults when fields are absent.  The task runs on the current
 /// Tokio runtime and should be aborted (via the returned `JoinHandle`) when
 /// the application shuts down.
+///
+/// The asynchronous loop itself remains lightweight: each cleanup pass is
+/// delegated to `spawn_blocking` because directory traversal, compression, and
+/// deletion are inherently blocking filesystem operations.
 ///
 /// # Arguments
 /// * `config` - Observability config containing cleanup parameters.
@@ -342,22 +378,21 @@ fn ensure_dir_permissions(log_directory: &str) -> Result<(), TelemetryError> {
 ///
 /// # Returns
 /// A [`tokio::task::JoinHandle`] for the spawned cleanup loop.
-fn spawn_cleanup_task(
+pub fn spawn_cleanup_task(
     config: &OtelConfig,
     log_directory: &str,
     log_filename: &str,
     keep_files: usize,
 ) -> tokio::task::JoinHandle<()> {
     let log_dir = std::path::PathBuf::from(log_directory);
-    // Use suffix matching for log files like "2026-03-01-06-21.rustfs.log"
-    // where "rustfs.log" is the suffix.
+    // Use suffix matching for log files like `2026-03-01-06-21.rustfs.log`
+    // where `rustfs.log` is the stable suffix generated by the rolling appender.
     let file_pattern = config.log_filename.as_deref().unwrap_or(log_filename).to_string();
+    let active_filename = file_pattern.clone();
 
-    // Determine match mode from config, defaulting to Suffix
-    let match_mode = match config.log_match_mode.as_deref().map(|s| s.to_lowercase()).as_deref() {
-        Some("prefix") => FileMatchMode::Prefix,
-        _ => FileMatchMode::Suffix,
-    };
+    // Determine match mode from config, defaulting to the repository-wide
+    // observability setting when the caller leaves it unset.
+    let match_mode = FileMatchMode::from_config_str(config.log_match_mode.as_deref().unwrap_or(DEFAULT_OBS_LOG_MATCH_MODE));
 
     let max_total_size = config
         .log_max_total_size_bytes
@@ -369,6 +404,21 @@ fn spawn_cleanup_task(
     let gzip_level = config
         .log_gzip_compression_level
         .unwrap_or(DEFAULT_OBS_LOG_GZIP_COMPRESSION_LEVEL);
+    let compression_algorithm = CompressionAlgorithm::from_config_str(
+        config
+            .log_compression_algorithm
+            .as_deref()
+            .unwrap_or(DEFAULT_OBS_LOG_COMPRESSION_ALGORITHM),
+    );
+    let parallel_compress = config.log_parallel_compress.unwrap_or(DEFAULT_OBS_LOG_PARALLEL_COMPRESS);
+    let parallel_workers = config.log_parallel_workers.unwrap_or(DEFAULT_OBS_LOG_PARALLEL_WORKERS);
+    let zstd_level = config
+        .log_zstd_compression_level
+        .unwrap_or(DEFAULT_OBS_LOG_ZSTD_COMPRESSION_LEVEL);
+    let zstd_fallback_to_gzip = config
+        .log_zstd_fallback_to_gzip
+        .unwrap_or(DEFAULT_OBS_LOG_ZSTD_FALLBACK_TO_GZIP);
+    let zstd_workers = config.log_zstd_workers.unwrap_or(DEFAULT_OBS_LOG_ZSTD_WORKERS);
     let retention_days = config
         .log_compressed_file_retention_days
         .unwrap_or(DEFAULT_OBS_LOG_COMPRESSED_FILE_RETENTION_DAYS);
@@ -386,34 +436,102 @@ fn spawn_cleanup_task(
         .log_cleanup_interval_seconds
         .unwrap_or(DEFAULT_OBS_LOG_CLEANUP_INTERVAL_SECONDS);
 
-    let cleaner = Arc::new(LogCleaner::new(
-        log_dir,
-        file_pattern,
-        match_mode,
-        keep_files,
-        max_total_size,
-        max_single_file_size,
-        compress,
-        gzip_level,
-        retention_days,
-        exclude_patterns,
-        delete_empty,
-        min_age,
-        dry_run,
-    ));
+    let cleaner = Arc::new(
+        LogCleaner::builder(log_dir, file_pattern, active_filename)
+            .match_mode(match_mode)
+            .keep_files(keep_files)
+            .max_total_size_bytes(max_total_size)
+            .max_single_file_size_bytes(max_single_file_size)
+            .compress_old_files(compress)
+            .gzip_compression_level(gzip_level)
+            // Compression behavior stays fully config-driven, but the builder
+            // clamps unsafe numeric values and preserves sensible defaults.
+            .compression_algorithm(compression_algorithm)
+            .parallel_compress(parallel_compress)
+            .parallel_workers(parallel_workers)
+            .zstd_compression_level(zstd_level)
+            .zstd_fallback_to_gzip(zstd_fallback_to_gzip)
+            .zstd_workers(zstd_workers)
+            .compressed_file_retention_days(retention_days)
+            .exclude_patterns(exclude_patterns)
+            .delete_empty_files(delete_empty)
+            .min_file_age_seconds(min_age)
+            .dry_run(dry_run)
+            .build(),
+    );
+
+    info!(
+        compression_algorithm = %compression_algorithm,
+        parallel_compress,
+        parallel_workers,
+        zstd_level,
+        zstd_fallback_to_gzip,
+        zstd_workers,
+        "log cleaner compression profile configured"
+    );
 
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(cleanup_interval));
         loop {
+            // Wait for the next scheduled tick before dispatching another pass.
+            // The blocking filesystem work runs on a dedicated blocking thread.
             interval.tick().await;
             let cleaner_clone = cleaner.clone();
             let result = tokio::task::spawn_blocking(move || cleaner_clone.cleanup()).await;
 
             match result {
-                Ok(Ok(_)) => {} // Success
-                Ok(Err(e)) => tracing::warn!("Log cleanup failed: {}", e),
-                Err(e) => tracing::warn!("Log cleanup task panicked: {}", e),
+                Ok(Ok(_)) => {
+                    counter!(METRIC_LOG_CLEANER_RUNS_TOTAL).increment(1);
+                }
+                Ok(Err(e)) => {
+                    counter!(METRIC_LOG_CLEANER_RUN_FAILURES_TOTAL).increment(1);
+                    tracing::warn!("Log cleanup failed: {}", e);
+                }
+                Err(e) => {
+                    counter!(METRIC_LOG_CLEANER_RUN_FAILURES_TOTAL).increment(1);
+                    tracing::warn!("Log cleanup task panicked: {}", e);
+                }
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::OtelConfig;
+    use tempfile::tempdir;
+
+    #[test]
+    /// Invalid file names should be reported as errors instead of panicking.
+    fn test_init_file_logging_invalid_filename_does_not_panic() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let temp_path = temp_dir.path().to_str().expect("temp dir path is utf-8");
+        let config = OtelConfig {
+            log_filename: Some("invalid\0name.log".to_string()),
+            ..OtelConfig::default()
+        };
+
+        // We must run within a Tokio runtime because init_file_logging_internal spawns a background task.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let result = init_file_logging_internal(&config, temp_path, "info", true);
+            // With eager file opening, an invalid filename (null byte) causes the OS to reject
+            // the open() call, so the function returns Err instead of panicking.
+            assert!(result.is_err(), "invalid filename must return Err, not panic");
+        });
+    }
+
+    #[test]
+    fn test_permission_denied_errors_fall_back_to_stdout() {
+        assert!(should_fallback_to_stdout(&TelemetryError::Io(
+            "Permission denied (os error 13)".to_string()
+        )));
+        assert!(should_fallback_to_stdout(&TelemetryError::SetPermissions(
+            "dir='/logs', want=0o755, have=0o777, err=Permission denied (os error 13)".to_string()
+        )));
+        assert!(!should_fallback_to_stdout(&TelemetryError::Io(
+            "No such file or directory (os error 2)".to_string()
+        )));
+    }
 }

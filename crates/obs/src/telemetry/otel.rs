@@ -31,29 +31,38 @@
 //!
 //! All exporters use **HTTP binary** (Protobuf) encoding with **gzip**
 //! compression for efficiency over the wire.
+//!
+//! If log export is not configured, this module deliberately falls back to the
+//! same rolling-file logging path used by the local backend so applications can
+//! combine OTLP traces/metrics with on-disk logs.
 
-use crate::TelemetryError;
+use crate::cleaner::types::FileMatchMode;
 use crate::config::OtelConfig;
-use crate::global::OBSERVABILITY_METRIC_ENABLED;
+use crate::global::set_observability_metric_enabled;
 use crate::telemetry::filter::build_env_filter;
 use crate::telemetry::guard::OtelGuard;
+use crate::telemetry::local::spawn_cleanup_task;
 use crate::telemetry::recorder::Recorder;
 use crate::telemetry::resource::build_resource;
+use crate::telemetry::rolling::{RollingAppender, Rotation};
+// Import helper functions from local.rs (sibling module)
+use crate::TelemetryError;
 use metrics::counter;
-use opentelemetry::{global, trace::TracerProvider};
+use opentelemetry::{global, propagation::TextMapCompositePropagator, trace::TracerProvider};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::{Compression, Protocol, WithExportConfig, WithHttpConfig};
-use opentelemetry_sdk::propagation::TraceContextPropagator;
+use opentelemetry_sdk::propagation::{BaggagePropagator, TraceContextPropagator};
 use opentelemetry_sdk::{
     logs::SdkLoggerProvider,
     metrics::{PeriodicReader, SdkMeterProvider},
     trace::{RandomIdGenerator, Sampler, SdkTracerProvider},
 };
+use rustfs_config::observability::{DEFAULT_OBS_LOG_MATCH_MODE, DEFAULT_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES};
 use rustfs_config::{
-    APP_NAME, DEFAULT_OBS_LOG_STDOUT_ENABLED, DEFAULT_OBS_LOGS_EXPORT_ENABLED, DEFAULT_OBS_METRICS_EXPORT_ENABLED,
-    DEFAULT_OBS_TRACES_EXPORT_ENABLED, METER_INTERVAL, SAMPLE_RATIO,
+    APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_ROTATION_TIME, DEFAULT_OBS_LOG_STDOUT_ENABLED, DEFAULT_OBS_LOGS_EXPORT_ENABLED,
+    DEFAULT_OBS_METRICS_EXPORT_ENABLED, DEFAULT_OBS_TRACES_EXPORT_ENABLED, METER_INTERVAL, SAMPLE_RATIO,
 };
-use std::{io::IsTerminal, time::Duration};
+use std::{fs, io::IsTerminal, time::Duration};
 use tracing::info;
 use tracing_error::ErrorLayer;
 use tracing_opentelemetry::{MetricsLayer, OpenTelemetryLayer};
@@ -92,15 +101,13 @@ pub(super) fn init_observability_http(
     is_production: bool,
 ) -> Result<OtelGuard, TelemetryError> {
     // ── Resource & sampling ──────────────────────────────────────────────────
+    // Build the common resource once so all enabled signals report the same
+    // service identity and deployment metadata.
     let res = build_resource(config);
     let service_name = config.service_name.as_deref().unwrap_or(APP_NAME).to_owned();
     let use_stdout = config.use_stdout.unwrap_or(!is_production);
     let sample_ratio = config.sample_ratio.unwrap_or(SAMPLE_RATIO);
-    let sampler = if (0.0..1.0).contains(&sample_ratio) {
-        Sampler::TraceIdRatioBased(sample_ratio)
-    } else {
-        Sampler::AlwaysOn
-    };
+    let sampler = build_tracer_sampler(sample_ratio);
 
     // ── Endpoint resolution ───────────────────────────────────────────────────
     // Each signal may have a dedicated endpoint; if absent, fall back to the
@@ -112,21 +119,42 @@ pub(super) fn init_observability_http(
         .as_deref()
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
-        .unwrap_or_else(|| format!("{root_ep}/v1/traces"));
+        .unwrap_or_else(|| {
+            if !root_ep.is_empty() {
+                format!("{root_ep}/v1/traces")
+            } else {
+                String::new()
+            }
+        });
 
     let metric_ep: String = config
         .metric_endpoint
         .as_deref()
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
-        .unwrap_or_else(|| format!("{root_ep}/v1/metrics"));
+        .unwrap_or_else(|| {
+            if !root_ep.is_empty() {
+                format!("{root_ep}/v1/metrics")
+            } else {
+                String::new()
+            }
+        });
 
+    // If `log_endpoint` is not explicitly set, fall back to `root_ep/v1/logs`
+    // only when a root endpoint exists. An empty result intentionally triggers
+    // the file-logging path below instead of silently disabling application logs.
     let log_ep: String = config
         .log_endpoint
         .as_deref()
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
-        .unwrap_or_else(|| format!("{root_ep}/v1/logs"));
+        .unwrap_or_else(|| {
+            if !root_ep.is_empty() {
+                format!("{root_ep}/v1/logs")
+            } else {
+                String::new()
+            }
+        });
 
     // ── Tracer provider (HTTP) ────────────────────────────────────────────────
     let tracer_provider = build_tracer_provider(&trace_ep, config, res.clone(), sampler, use_stdout)?;
@@ -134,48 +162,141 @@ pub(super) fn init_observability_http(
     // ── Meter provider (HTTP) ─────────────────────────────────────────────────
     let meter_provider = build_meter_provider(&metric_ep, config, res.clone(), &service_name, use_stdout)?;
 
-    // ── Logger provider (HTTP) ────────────────────────────────────────────────
-    let logger_provider = build_logger_provider(&log_ep, config, res, use_stdout)?;
-
     #[cfg(unix)]
     let profiling_agent = init_profiler(config);
 
+    // ── Logger Logic ──────────────────────────────────────────────────────────
+    // Logging is the only signal that may intentionally route to either OTLP
+    // or local files depending on configuration completeness.
+    let mut logger_provider: Option<SdkLoggerProvider> = None;
+    let mut otel_bridge = None;
+    let mut file_layer_opt = None; // File layer (File mode)
+    let mut stdout_layer_opt = None; // Stdout layer (File mode)
+    let mut cleanup_handle = None;
+    let mut tracing_guard = None; // Guard for file writer
+    let mut stdout_guard = None; // Guard for stdout writer (File mode)
+    let mut force_stdout_logging = false;
+
+    // ── Case 1: OTLP Logging
+    if !log_ep.is_empty() {
+        // Init OTLP logger logic.
+        // We initialize the OTLP collector and honor the configured stdout setting
+        // (e.g. via RUSTFS_OBS_USE_STDOUT / config.use_stdout) when building the provider.
+        logger_provider = build_logger_provider(&log_ep, config, res, false)?;
+
+        // Build bridge to capture `tracing` events.
+        otel_bridge = logger_provider
+            .as_ref()
+            .map(|p| OpenTelemetryTracingBridge::new(p).with_filter(build_env_filter(logger_level, None)));
+
+        // No separate formatting layer is added here; when OTLP logging is
+        // active, the OpenTelemetry bridge is the authoritative sink for
+        // `tracing` events unless local file logging is needed as a fallback.
+    }
+    let span_events = if is_production { FmtSpan::CLOSE } else { FmtSpan::FULL };
+    // ── Case 2: File Logging
+    // If a log directory is configured and OTLP log export is unavailable, use
+    // the same rolling-file behavior as the local-only telemetry backend.
+    if let Some(log_directory) = config.log_directory.as_deref().filter(|s| !s.is_empty())
+        && logger_provider.is_none()
+    {
+        let log_filename = config.log_filename.as_deref().unwrap_or(&service_name);
+        let keep_files = config.log_keep_files.unwrap_or(DEFAULT_LOG_KEEP_FILES);
+        let file_logging_result = (|| -> Result<_, TelemetryError> {
+            fs::create_dir_all(log_directory).map_err(|e| TelemetryError::Io(e.to_string()))?;
+
+            #[cfg(unix)]
+            crate::telemetry::local::ensure_dir_permissions(log_directory)?;
+
+            let rotation_str = config
+                .log_rotation_time
+                .as_deref()
+                .unwrap_or(DEFAULT_LOG_ROTATION_TIME)
+                .to_lowercase();
+            let match_mode =
+                FileMatchMode::from_config_str(config.log_match_mode.as_deref().unwrap_or(DEFAULT_OBS_LOG_MATCH_MODE));
+            let rotation = match rotation_str.as_str() {
+                "minutely" => Rotation::Minutely,
+                "hourly" => Rotation::Hourly,
+                "daily" => Rotation::Daily,
+                _ => Rotation::Daily,
+            };
+            let max_single_file_size = config
+                .log_max_single_file_size_bytes
+                .unwrap_or(DEFAULT_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES);
+
+            let file_appender =
+                RollingAppender::new(log_directory, log_filename.to_string(), rotation, max_single_file_size, match_mode)?;
+
+            let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+            let file_layer = tracing_subscriber::fmt::layer()
+                .with_timer(LocalTime::rfc_3339())
+                .with_target(true)
+                .with_ansi(false)
+                .with_thread_names(true)
+                .with_thread_ids(true)
+                .with_file(true)
+                .with_line_number(true)
+                .with_writer(non_blocking)
+                .json()
+                .with_current_span(true)
+                .with_span_list(true)
+                .with_span_events(span_events.clone())
+                .with_filter(build_env_filter(logger_level, None));
+            let cleanup_handle = spawn_cleanup_task(config, log_directory, log_filename, keep_files);
+            Ok((file_layer, guard, cleanup_handle, rotation_str))
+        })();
+
+        match file_logging_result {
+            Ok((file_layer, guard, new_cleanup_handle, rotation_str)) => {
+                tracing_guard = Some(guard);
+                file_layer_opt = Some(file_layer);
+                cleanup_handle = Some(new_cleanup_handle);
+
+                info!(
+                    "Init file logging at '{}', rotation: {}, keep {} files",
+                    log_directory, rotation_str, keep_files
+                );
+            }
+            Err(error) if crate::telemetry::local::should_fallback_to_stdout(&error) => {
+                crate::telemetry::local::emit_file_logging_fallback_warning(log_directory, &error);
+                force_stdout_logging = true;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
     // ── Tracing subscriber registry ───────────────────────────────────────────
-    // Build an optional stdout formatting layer. When `log_stdout_enabled` is
-    // false the field is `None` and tracing-subscriber will skip it.
-    let fmt_layer_opt = if config.log_stdout_enabled.unwrap_or(DEFAULT_OBS_LOG_STDOUT_ENABLED) {
-        let enable_color = std::io::stdout().is_terminal();
-        let span_event = if is_production { FmtSpan::CLOSE } else { FmtSpan::FULL };
-        let layer = tracing_subscriber::fmt::layer()
-            .with_timer(LocalTime::rfc_3339())
-            .with_target(true)
-            .with_ansi(enable_color)
-            .with_thread_names(true)
-            .with_thread_ids(true)
-            .with_file(true)
-            .with_line_number(true)
-            .json()
-            .with_current_span(true)
-            .with_span_list(true)
-            .with_span_events(span_event)
-            .with_filter(build_env_filter(logger_level, None));
-        Some(layer)
-    } else {
-        None
-    };
-    let filter = build_env_filter(logger_level, None);
-    let otel_bridge = logger_provider
-        .as_ref()
-        .map(|p| OpenTelemetryTracingBridge::new(p).with_filter(build_env_filter(logger_level, None)));
     let tracer_layer = tracer_provider
         .as_ref()
         .map(|p| OpenTelemetryLayer::new(p.tracer(service_name.to_string())));
     let metrics_layer = meter_provider.as_ref().map(|p| MetricsLayer::new(p.clone()));
 
+    // Optional stdout mirror (matching init_file_logging_internal logic)
+    // This is separate from OTLP stdout logic. If file logging is enabled, we honor its stdout rules.
+    if force_stdout_logging || config.log_stdout_enabled.unwrap_or(DEFAULT_OBS_LOG_STDOUT_ENABLED) || !is_production {
+        let (stdout_nb, stdout_g) = tracing_appender::non_blocking(std::io::stdout());
+        stdout_guard = Some(stdout_g);
+        stdout_layer_opt = Some(
+            tracing_subscriber::fmt::layer()
+                .with_timer(LocalTime::rfc_3339())
+                .with_target(true)
+                .with_ansi(std::io::stdout().is_terminal())
+                .with_thread_names(true)
+                .with_thread_ids(true)
+                .with_file(true)
+                .with_line_number(true)
+                .with_writer(stdout_nb)
+                .with_span_events(span_events)
+                .with_filter(build_env_filter(logger_level, None)),
+        );
+    }
+    let filter = build_env_filter(logger_level, None);
     tracing_subscriber::registry()
         .with(filter)
         .with(ErrorLayer::default())
-        .with(fmt_layer_opt)
+        .with(file_layer_opt) // File
+        .with(stdout_layer_opt) // Stdout (only if file logging enabled it)
         .with(tracer_layer)
         .with(otel_bridge)
         .with(metrics_layer)
@@ -193,9 +314,9 @@ pub(super) fn init_observability_http(
         logger_provider,
         #[cfg(unix)]
         profiling_agent,
-        tracing_guard: None,
-        stdout_guard: None,
-        cleanup_handle: None,
+        tracing_guard,
+        stdout_guard,
+        cleanup_handle,
     })
 }
 
@@ -204,6 +325,9 @@ pub(super) fn init_observability_http(
 /// Build an optional [`SdkTracerProvider`] for the given trace endpoint.
 ///
 /// Returns `None` when the endpoint is empty or trace export is disabled.
+/// When enabled, the provider is also registered as the global tracer provider
+/// and installs a composite propagator supporting both W3C TraceContext
+/// (traceparent header) and W3C Baggage (baggage header) propagation.
 fn build_tracer_provider(
     trace_ep: &str,
     config: &OtelConfig,
@@ -235,13 +359,34 @@ fn build_tracer_provider(
 
     let provider = builder.build();
     global::set_tracer_provider(provider.clone());
-    global::set_text_map_propagator(TraceContextPropagator::new());
+
+    // Configure composite propagator to support multiple trace context formats:
+    // - W3C TraceContext (traceparent header) - standard format for distributed tracing
+    // - W3C Baggage (baggage header) - for propagating user-defined key-value pairs
+    let propagator =
+        TextMapCompositePropagator::new(vec![Box::new(TraceContextPropagator::new()), Box::new(BaggagePropagator::new())]);
+    global::set_text_map_propagator(propagator);
+
     Ok(Some(provider))
+}
+
+/// Convert a configured sample ratio into the SDK sampler strategy.
+///
+/// Invalid or non-finite ratios fall back to `AlwaysOn` so telemetry does not
+/// disappear due to configuration mistakes.
+fn build_tracer_sampler(sample_ratio: f64) -> Sampler {
+    if sample_ratio.is_finite() && (0.0..=1.0).contains(&sample_ratio) {
+        Sampler::TraceIdRatioBased(sample_ratio)
+    } else {
+        Sampler::AlwaysOn
+    }
 }
 
 /// Build an optional [`SdkMeterProvider`] for the given metrics endpoint.
 ///
 /// Returns `None` when the endpoint is empty or metric export is disabled.
+/// The provider is paired with the crate's metrics recorder so `metrics` crate
+/// instruments flow into OpenTelemetry readers.
 fn build_meter_provider(
     metric_ep: &str,
     config: &OtelConfig,
@@ -279,15 +424,16 @@ fn build_meter_provider(
         })
         .build();
 
-    global::set_meter_provider(provider.clone() as SdkMeterProvider);
+    global::set_meter_provider(provider.clone());
     metrics::set_global_recorder(recorder).map_err(|e| TelemetryError::InstallMetricsRecorder(e.to_string()))?;
-    OBSERVABILITY_METRIC_ENABLED.set(true).ok();
+    set_observability_metric_enabled(true);
     Ok(Some(provider))
 }
 
 /// Build an optional [`SdkLoggerProvider`] for the given log endpoint.
 ///
 /// Returns `None` when the endpoint is empty or log export is disabled.
+/// The caller wraps the resulting provider in an OpenTelemetry tracing bridge.
 fn build_logger_provider(
     log_ep: &str,
     config: &OtelConfig,
@@ -314,8 +460,10 @@ fn build_logger_provider(
     Ok(Some(builder.build()))
 }
 
-/// Starts the Pyroscope continuous profiling agent if `ENV_OBS_PROFILING_ENDPOINT` is set.
-/// No-op and returns None on non-unix platforms.
+/// Start the Pyroscope continuous profiling agent when profiling is enabled.
+///
+/// Returns `None` on non-Unix platforms, when the feature is disabled, or when
+/// no usable profiling endpoint is configured.
 #[cfg(unix)]
 fn init_profiler(config: &OtelConfig) -> Option<pyroscope::PyroscopeAgent<pyroscope::pyroscope::PyroscopeAgentRunning>> {
     use pyroscope::backend::{BackendConfig, PprofConfig, pprof_backend};
@@ -355,8 +503,39 @@ fn init_profiler(config: &OtelConfig) -> Option<pyroscope::PyroscopeAgent<pyrosc
 }
 
 /// Create a stdout periodic metrics reader for the given interval.
+///
+/// This helper is primarily used for local development and diagnostics when
+/// operators want to see exported metric points without an OTLP collector.
 fn create_periodic_reader(interval: u64) -> PeriodicReader<opentelemetry_stdout::MetricExporter> {
     PeriodicReader::builder(opentelemetry_stdout::MetricExporter::default())
         .with_interval(Duration::from_secs(interval))
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    /// Valid ratios should produce trace-id-ratio sampling.
+    fn test_build_tracer_sampler_uses_trace_ratio_for_valid_values() {
+        let sampler = build_tracer_sampler(0.0);
+        assert!(format!("{sampler:?}").contains("TraceIdRatioBased"));
+
+        let sampler = build_tracer_sampler(1.0);
+        assert!(format!("{sampler:?}").contains("TraceIdRatioBased"));
+
+        let sampler = build_tracer_sampler(0.5);
+        assert!(format!("{sampler:?}").contains("TraceIdRatioBased"));
+    }
+
+    #[test]
+    /// Invalid ratios should degrade to the safest non-dropping sampler.
+    fn test_build_tracer_sampler_rejects_invalid_ratio_with_always_on() {
+        let sampler = build_tracer_sampler(-0.1);
+        assert!(format!("{sampler:?}").contains("AlwaysOn"));
+
+        let sampler = build_tracer_sampler(1.2);
+        assert!(format!("{sampler:?}").contains("AlwaysOn"));
+    }
 }

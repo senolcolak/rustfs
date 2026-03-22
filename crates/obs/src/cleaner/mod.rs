@@ -14,17 +14,32 @@
 
 //! Log-file cleanup subsystem.
 //!
-//! This module provides [`LogCleaner`], a configurable manager that
-//! periodically removes, compresses, or archives old rolling log files.
+//! This module exposes the high-level [`LogCleaner`] API used by the
+//! observability layer to manage rotated log files after they are no longer
+//! active. The implementation is intentionally split into small focused
+//! sub-modules so each concern can evolve independently without turning the
+//! cleaner into a monolithic state machine.
+//!
+//! At a high level, one cleanup pass follows this lifecycle:
+//!
+//! 1. scan the target directory and classify matching entries;
+//! 2. decide which regular log files exceed retention constraints;
+//! 3. optionally compress those files using the configured codec;
+//! 4. delete only files that are safe to remove;
+//! 5. separately expire already-compressed archives by age.
+//!
+//! The design favors operational safety over aggressive reclamation:
+//! compression and deletion are decoupled, symlinks are rejected on removal,
+//! and dry-run mode reports intent without mutating the filesystem.
 //!
 //! ## Sub-modules
 //!
 //! | Module      | Responsibility                                           |
 //! |-------------|----------------------------------------------------------|
-//! | `types`     | Shared data types (`FileInfo`)                           |
-//! | `scanner`   | Filesystem traversal — discovers eligible files          |
-//! | `compress`  | Gzip compression helper                                  |
-//! | `core`      | Core orchestration — selection, compression, deletion    |
+//! | `types`     | Shared enums and metadata (`FileInfo`, match/compression choices) |
+//! | `scanner`   | Filesystem traversal, pattern matching, empty-file handling       |
+//! | `compress`  | Archive creation helpers for gzip and zstd                       |
+//! | `core`      | Selection, parallel/serial processing, secure deletion           |
 //!
 //! ## Usage
 //!
@@ -33,21 +48,23 @@
 //! use rustfs_obs::LogCleaner;
 //! use rustfs_obs::types::FileMatchMode;
 //!
-//! let cleaner = LogCleaner::new(
+//! let cleaner = LogCleaner::builder(
 //!     PathBuf::from("/var/log/rustfs"),
 //!     "rustfs.log.".to_string(),
-//!     FileMatchMode::Prefix,
-//!     10,              // keep_files
-//!     2 * 1024 * 1024 * 1024, // max_total_size_bytes (2 GiB)
-//!     0,               // max_single_file_size_bytes (unlimited)
-//!     true,            // compress_old_files
-//!     6,               // gzip_compression_level
-//!     30,              // compressed_file_retention_days
-//!     vec![],          // exclude_patterns
-//!     true,            // delete_empty_files
-//!     3600,            // min_file_age_seconds (1 hour)
-//!     false,           // dry_run
-//! );
+//!     "rustfs.log".to_string(),
+//! )
+//! .match_mode(FileMatchMode::Prefix)
+//! .keep_files(10)
+//! .max_total_size_bytes(2 * 1024 * 1024 * 1024) // 2 GiB
+//! .max_single_file_size_bytes(0) // unlimited
+//! .compress_old_files(true)
+//! .gzip_compression_level(6)
+//! .compressed_file_retention_days(30)
+//! .exclude_patterns(vec![])
+//! .delete_empty_files(true)
+//! .min_file_age_seconds(3600) // 1 hour
+//! .dry_run(false)
+//! .build();
 //!
 //! let (deleted, freed_bytes) = cleaner.cleanup().expect("cleanup failed");
 //! println!("Deleted {deleted} files, freed {freed_bytes} bytes");
@@ -58,6 +75,10 @@ mod core;
 mod scanner;
 pub mod types;
 
+/// Primary entry point for the cleaner subsystem.
+///
+/// Re-exported from [`core`] so callers can construct a cleaner without
+/// knowing the internal module layout.
 pub use core::LogCleaner;
 
 #[cfg(test)]
@@ -70,6 +91,7 @@ mod tests {
     use std::path::Path;
     use tempfile::TempDir;
 
+    /// Create a test log file with deterministic contents and size.
     fn create_log_file(dir: &Path, name: &str, size: usize) -> std::io::Result<()> {
         let path = dir.join(name);
         let mut f = File::create(path)?;
@@ -79,21 +101,13 @@ mod tests {
 
     /// Build a cleaner with sensible test defaults (no compression, no age gate).
     fn make_cleaner(dir: std::path::PathBuf, keep: usize, max_bytes: u64) -> LogCleaner {
-        LogCleaner::new(
-            dir,
-            "app.log.".to_string(),
-            FileMatchMode::Prefix,
-            keep,
-            max_bytes,
-            0,          // max_single_file_size_bytes
-            false,      // compress_old_files
-            6,          // gzip_compression_level
-            30,         // compressed_file_retention_days
-            Vec::new(), // exclude_patterns
-            true,       // delete_empty_files
-            0,          // min_file_age_seconds (0 = no age gate in tests)
-            false,      // dry_run
-        )
+        LogCleaner::builder(dir, "app.log.".to_string(), "app.log".to_string())
+            .match_mode(FileMatchMode::Prefix)
+            .keep_files(keep)
+            .max_total_size_bytes(max_bytes)
+            .min_file_age_seconds(0) // 0 = no age gate in tests
+            .delete_empty_files(true)
+            .build()
     }
 
     #[test]
@@ -141,11 +155,15 @@ mod tests {
         create_log_file(&dir, "app.log.2024-01-02", 1024)?;
         create_log_file(&dir, "other.log", 512)?; // different prefix
 
-        let cleaner = make_cleaner(dir.clone(), 1, 512);
+        // keep_files=1 and max_bytes=1500: deleting one managed file (1024 bytes) leaves
+        // a single managed file of 1024 bytes, which satisfies both the file-count and
+        // size limits.  "other.log" (different prefix) must never be touched.
+        let cleaner = make_cleaner(dir.clone(), 1, 1500);
         let (deleted, _) = cleaner.cleanup()?;
 
-        // "other.log" must not be counted or deleted.
+        // "other.log" must not be counted or deleted; only 1 managed file removed.
         assert_eq!(deleted, 1, "only managed files should be deleted");
+        assert!(dir.join("other.log").exists(), "unrelated file must not be deleted");
         Ok(())
     }
 
@@ -158,8 +176,8 @@ mod tests {
         create_log_file(&dir, "app.log.2024-01-02", 2048)?;
         create_log_file(&dir, "other.log", 512)?;
 
-        let files = scanner::collect_log_files(&dir, "app.log.", FileMatchMode::Prefix, &[], 0, true, false)?;
-        assert_eq!(files.len(), 2, "scanner should find exactly 2 managed files");
+        let result = scanner::scan_log_directory(&dir, "app.log.", Some("app.log"), FileMatchMode::Prefix, &[], 0, true, false)?;
+        assert_eq!(result.logs.len(), 2, "scanner should find exactly 2 managed files");
         Ok(())
     }
 
@@ -172,21 +190,12 @@ mod tests {
         create_log_file(&dir, "app.log.2024-01-02", 1024)?;
         create_log_file(&dir, "app.log.2024-01-03", 1024)?;
 
-        let cleaner = LogCleaner::new(
-            dir.clone(),
-            "app.log.".to_string(),
-            FileMatchMode::Prefix,
-            1,
-            1024,
-            0,
-            false,
-            6,
-            30,
-            vec![],
-            true,
-            0,
-            true,
-        );
+        let cleaner = LogCleaner::builder(dir.clone(), "app.log.".to_string(), "app.log".to_string())
+            .match_mode(FileMatchMode::Prefix)
+            .keep_files(1)
+            .max_total_size_bytes(1024)
+            .dry_run(true)
+            .build();
         let (deleted, _freed) = cleaner.cleanup()?;
 
         // dry_run=true reports deletions but doesn't actually remove files.
@@ -204,21 +213,11 @@ mod tests {
         create_log_file(&dir, "2026-03-01-06-22.rustfs.log", 1024)?;
         create_log_file(&dir, "other.log", 1024)?; // not managed
 
-        let cleaner = LogCleaner::new(
-            dir.clone(),
-            "rustfs.log".to_string(),
-            FileMatchMode::Suffix,
-            1,
-            1024,
-            0,
-            false,
-            6,
-            30,
-            vec![],
-            true,
-            0,
-            false,
-        );
+        let cleaner = LogCleaner::builder(dir.clone(), ".rustfs.log".to_string(), "current.log".to_string())
+            .match_mode(FileMatchMode::Suffix)
+            .keep_files(1)
+            .max_total_size_bytes(1024)
+            .build();
         let (deleted, freed) = cleaner.cleanup()?;
 
         assert_eq!(deleted, 1, "should delete exactly one file");

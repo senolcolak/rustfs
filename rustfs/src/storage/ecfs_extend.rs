@@ -12,9 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::config::workload_profiles::{
-    RustFSBufferConfig, WorkloadProfile, get_global_buffer_config, is_buffer_profile_enabled,
-};
+use crate::config::{RustFSBufferConfig, WorkloadProfile, get_global_buffer_config, is_buffer_profile_enabled};
 use crate::error::ApiError;
 use crate::server::cors;
 use crate::storage::ecfs::ListObjectUnorderedQuery;
@@ -31,7 +29,7 @@ use rustfs_targets::EventName;
 use rustfs_targets::arn::{TargetID, TargetIDError};
 use rustfs_utils::http::{
     AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
-    RESERVED_METADATA_PREFIX_LOWER,
+    SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, insert_str,
 };
 use s3s::dto::{
     Delimiter, LambdaFunctionConfiguration, NotificationConfigurationFilter, ObjectLockConfiguration, ObjectLockEnabled,
@@ -118,6 +116,22 @@ pub(crate) fn apply_lock_retention(object_lock_config: Option<ObjectLockConfigur
 /// let buffer_size = get_adaptive_buffer_size_with_profile(
 ///     10 * 1024 * 1024,
 ///     Some(WorkloadProfile::SecureStorage)
+/// );
+///
+/// // Use custom profile for specialized requirements
+/// let custom_profile = WorkloadProfile::custom(
+///     32 * 1024,      // min_size: 32KB
+///     2 * 1024 * 1024, // max_size: 2MB
+///     256 * 1024,     // default_unknown: 256KB
+///     vec![
+///         (1024 * 1024, 64 * 1024),           // < 1MB: 64KB
+///         (10 * 1024 * 1024, 128 * 1024),     // 1MB-10MB: 128KB
+///         (i64::MAX, 512 * 1024),             // >= 10MB: 512KB
+///     ],
+/// );
+/// let buffer_size = get_adaptive_buffer_size_with_profile(
+///     5 * 1024 * 1024,
+///     Some(custom_profile)
 /// );
 /// ```
 ///
@@ -284,8 +298,9 @@ pub(crate) fn parse_object_lock_retention(retention: Option<ObjectLockRetention>
         // This is intentional behavior. Empty string represents "retention cleared" which is different from "retention never set". Consistent with minio
         eval_metadata.insert(AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), mode);
         eval_metadata.insert(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), retain_until_date);
-        eval_metadata.insert(
-            format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "objectlock-retention-timestamp"),
+        insert_str(
+            &mut eval_metadata,
+            SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP,
             format!("{}.{:09}Z", now.format(&Rfc3339).unwrap(), now.nanosecond()),
         );
     }
@@ -310,8 +325,9 @@ pub(crate) fn parse_object_lock_legal_hold(legal_hold: Option<ObjectLockLegalHol
         let now = OffsetDateTime::now_utc();
         // This is intentional behavior. Empty string represents "status cleared" which is different from "status never set".
         eval_metadata.insert(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.to_string(), status);
-        eval_metadata.insert(
-            format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "objectlock-legalhold-timestamp"),
+        insert_str(
+            &mut eval_metadata,
+            SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP,
             format!("{}.{:09}Z", now.format(&Rfc3339).unwrap(), now.nanosecond()),
         );
     }

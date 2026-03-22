@@ -28,18 +28,17 @@ documentation = "https://docs.rs/rustfs-obs/latest/rustfs_obs/"
 [lints]
 workspace = true
 
-[features]
-default = []
-gpu = ["dep:nvml-wrapper"]
-full = ["gpu"]
-
 [dependencies]
 rustfs-config = { workspace = true, features = ["constants", "observability"] }
-rustfs-utils = { workspace = true, features = ["ip", "path"] }
+rustfs-utils = { workspace = true, features = ["ip"] }
 flate2 = { workspace = true }
 glob = { workspace = true }
+jiff = { workspace = true }
 metrics = { workspace = true }
-nvml-wrapper = { workspace = true, optional = true }
+crossbeam-channel = { workspace = true }
+crossbeam-deque = { workspace = true }
+crossbeam-utils = { workspace = true }
+num_cpus = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry-appender-tracing = { workspace = true, features = ["experimental_use_tracing_span_context", "experimental_metadata_attributes"] }
 opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
@@ -47,16 +46,14 @@ opentelemetry-stdout = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 opentelemetry-semantic-conventions = { workspace = true, features = ["semconv_experimental"] }
 serde = { workspace = true }
-smallvec = { workspace = true, features = ["serde"] }
 tracing = { workspace = true, features = ["std", "attributes"] }
 tracing-appender = { workspace = true }
 tracing-error = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["registry", "std", "fmt", "env-filter", "tracing-log", "time", "local-time", "json"] }
 tokio = { workspace = true, features = ["sync", "fs", "rt-multi-thread", "rt", "time", "macros"] }
-sysinfo = { workspace = true }
 thiserror = { workspace = true }
-walkdir = { workspace = true }
+zstd = { workspace = true, features = ["zstdmt"] }
 
 [target.'cfg(unix)'.dependencies]
 pyroscope = { workspace = true, features = ["backend-pprof-rs"] }
@@ -65,3 +62,4 @@ pyroscope = { workspace = true, features = ["backend-pprof-rs"] }
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
 tempfile = { workspace = true }
+temp-env = { workspace = true }

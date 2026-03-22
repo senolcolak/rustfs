@@ -36,7 +36,7 @@ mkdir -p ./target/volume/test{1..4}
 
 if [ -z "$RUST_LOG" ]; then
     export RUST_BACKTRACE=1
-    export RUST_LOG="rustfs=debug,ecstore=info,s3s=debug,iam=info,notify=info"
+    export RUST_LOG="info,rustfs=debug,rustfs_ecstore=info,s3s=debug,rustfs_iam=info,rustfs_notify=info"
 fi
 
 # export RUSTFS_ERASURE_SET_DRIVE_COUNT=5
@@ -53,7 +53,7 @@ export RUSTFS_CONSOLE_ADDRESS=":9001"
 # export RUSTFS_TLS_PATH="./deploy/certs"
 
 # Observability related configuration
-#export RUSTFS_OBS_ENDPOINT=http://localhost:4318 # OpenTelemetry Collector address
+export RUSTFS_OBS_ENDPOINT=http://localhost:4318 # OpenTelemetry Collector address
 # RustFS OR OTEL exporter configuration
 #export RUSTFS_OBS_TRACE_ENDPOINT=http://localhost:4318/v1/traces # OpenTelemetry Collector trace address http://localhost:4318/v1/traces
 #export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://localhost:14318/v1/traces
@@ -61,26 +61,27 @@ export RUSTFS_CONSOLE_ADDRESS=":9001"
 #export OTEL_EXPORTER_OTLP_METRICS_ENDPOINT=http://localhost:9090/api/v1/otlp/v1/metrics
 #export RUSTFS_OBS_LOG_ENDPOINT=http://loki:3100/otlp/v1/logs # OpenTelemetry Collector logs address http://loki:3100/otlp/v1/logs
 #export OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://loki:3100/otlp/v1/logs
-#export RUSTFS_OBS_PROFILING_ENDPOINT=http://localhost:4040 # OpenTelemetry Collector profiling address
+export RUSTFS_OBS_PROFILING_ENDPOINT=http://localhost:4040 # OpenTelemetry Collector profiling address
 #export RUSTFS_OBS_USE_STDOUT=true # Whether to use standard output
-#export RUSTFS_OBS_SAMPLE_RATIO=2.0 # Sample ratio, between 0.0-1.0, 0.0 means no sampling, 1.0 means full sampling
-#export RUSTFS_OBS_METER_INTERVAL=1 # Sampling interval in seconds
-#export RUSTFS_OBS_SERVICE_NAME=rustfs # Service name
-#export RUSTFS_OBS_SERVICE_VERSION=0.1.0 # Service version
+export RUSTFS_OBS_SAMPLE_RATIO=2.0 # Sample ratio, between 0.0-1.0, 0.0 means no sampling, 1.0 means full sampling
+export RUSTFS_OBS_METER_INTERVAL=1 # Sampling interval in seconds
+export RUSTFS_OBS_SERVICE_NAME=rustfs # Service name
+export RUSTFS_OBS_SERVICE_VERSION=0.1.0 # Service version
 export RUSTFS_OBS_ENVIRONMENT=production # Environment name development, staging, production
 export RUSTFS_OBS_LOGGER_LEVEL=info # Log level, supports trace, debug, info, warn, error
-export RUSTFS_OBS_LOG_STDOUT_ENABLED=false # Whether to enable local stdout logging
+#export RUSTFS_OBS_LOG_STDOUT_ENABLED=true # Whether to enable local stdout logging
 export RUSTFS_OBS_LOG_DIRECTORY="$current_dir/deploy/logs" # Log directory
 export RUSTFS_OBS_LOG_ROTATION_TIME="minutely" # Log rotation time unit, can be "minutely", "hourly", "daily"
-export RUSTFS_OBS_LOG_KEEP_FILES=30 # Number of log files to keep
-export RUSTFS_OBS_LOG_MESSAGE_CAPA=32768 # Log message capacity
-export RUSTFS_OBS_LOG_FLUSH_MS=300 # Log flush interval in milliseconds
+export RUSTFS_OBS_LOG_KEEP_FILES=10 # Number of log files to keep
+export RUSTFS_OBS_LOG_CLEANUP_INTERVAL_SECONDS=30
+export RUSTFS_OBS_LOG_MIN_FILE_AGE_SECONDS=60
+export RUSTFS_OBS_LOG_COMPRESSED_FILE_RETENTION_DAYS=7
+
 
 #tokio runtime
 export RUSTFS_RUNTIME_WORKER_THREADS=16
 export RUSTFS_RUNTIME_MAX_BLOCKING_THREADS=1024
 export RUSTFS_RUNTIME_THREAD_PRINT_ENABLED=false
-export RUSTFS_OBS_LOG_CLEANUP_INTERVAL_SECONDS=300
 # shellcheck disable=SC2125
 export RUSTFS_RUNTIME_THREAD_STACK_SIZE=1024*1024
 export RUSTFS_RUNTIME_THREAD_KEEP_ALIVE=60
